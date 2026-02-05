@@ -9,6 +9,7 @@ import (
 	"go.universe.tf/metallb/api/v1beta1"
 	"go.universe.tf/metallb/api/v1beta2"
 	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/utils/ptr"
 )
 
 func TestValidate(t *testing.T) {
@@ -70,12 +71,58 @@ func TestValidate(t *testing.T) {
 			mustFail: true,
 		},
 		{
-			desc: "keepalive time",
+			desc: "v6 address but pool not selected",
 			config: ClusterResources{
-				Peers: []v1beta2.BGPPeer{
+				Pools: []v1beta1.IPAddressPool{
 					{
-						Spec: v1beta2.BGPPeerSpec{
-							KeepaliveTime: v1.Duration{Duration: time.Second},
+						ObjectMeta: v1.ObjectMeta{
+							Name: "foo",
+						},
+						Spec: v1beta1.IPAddressPoolSpec{
+							Addresses: []string{"2001:db8::/64"},
+						},
+					},
+				},
+				BGPAdvs: []v1beta1.BGPAdvertisement{
+					{
+						ObjectMeta: v1.ObjectMeta{
+							Name: "foo",
+						},
+						Spec: v1beta1.BGPAdvertisementSpec{
+							IPAddressPools: []string{"bar"},
+						},
+					},
+				},
+			},
+		},
+		{
+			desc: "v6 address and selected",
+			config: ClusterResources{
+				Pools: []v1beta1.IPAddressPool{
+					{
+						ObjectMeta: v1.ObjectMeta{
+							Name: "foo",
+						},
+						Spec: v1beta1.IPAddressPoolSpec{
+							Addresses: []string{"2001:db8::/64"},
+						},
+					},
+				},
+				BGPAdvs: []v1beta1.BGPAdvertisement{
+					{
+						ObjectMeta: v1.ObjectMeta{
+							Name: "bar",
+						},
+						Spec: v1beta1.BGPAdvertisementSpec{
+							IPAddressPools: []string{"foo1"},
+						},
+					},
+					{
+						ObjectMeta: v1.ObjectMeta{
+							Name: "bar",
+						},
+						Spec: v1beta1.BGPAdvertisementSpec{
+							IPAddressPools: []string{"foo"},
 						},
 					},
 				},
@@ -83,16 +130,116 @@ func TestValidate(t *testing.T) {
 			mustFail: true,
 		},
 		{
-			desc: "large BGP community inside legacy pool",
+			desc: "v6 address and selected by labels",
 			config: ClusterResources{
-				LegacyAddressPools: []v1beta1.AddressPool{
+				Pools: []v1beta1.IPAddressPool{
 					{
-						Spec: v1beta1.AddressPoolSpec{
-							BGPAdvertisements: []v1beta1.LegacyBgpAdvertisement{
+						ObjectMeta: v1.ObjectMeta{
+							Name:   "foo",
+							Labels: map[string]string{"key": "value"},
+						},
+						Spec: v1beta1.IPAddressPoolSpec{
+							Addresses: []string{"2001:db8::/64"},
+						},
+					},
+				},
+				BGPAdvs: []v1beta1.BGPAdvertisement{
+					{
+						ObjectMeta: v1.ObjectMeta{
+							Name: "bar",
+						},
+						Spec: v1beta1.BGPAdvertisementSpec{
+							IPAddressPools: []string{"foo1"},
+						},
+					},
+					{
+						ObjectMeta: v1.ObjectMeta{
+							Name: "bar",
+						},
+						Spec: v1beta1.BGPAdvertisementSpec{
+							IPAddressPoolSelectors: []v1.LabelSelector{
 								{
-									Communities: []string{"large:123:456:789"},
+									MatchLabels: map[string]string{"key": "value"},
 								},
 							},
+						},
+					},
+				},
+			},
+			mustFail: true,
+		},
+		{
+			desc: "enable BGP GracefulRestart",
+			config: ClusterResources{
+				Peers: []v1beta2.BGPPeer{
+					{
+						Spec: v1beta2.BGPPeerSpec{
+							EnableGracefulRestart: true,
+						},
+					},
+				},
+			},
+			mustFail: true,
+		},
+		{
+			desc: "disable BGP MP",
+			config: ClusterResources{
+				Peers: []v1beta2.BGPPeer{
+					{
+						Spec: v1beta2.BGPPeerSpec{
+							DisableMP: true,
+						},
+					},
+				},
+			},
+			mustFail: true,
+		},
+		{
+			desc: "dynamic ASN",
+			config: ClusterResources{
+				Peers: []v1beta2.BGPPeer{
+					{
+						Spec: v1beta2.BGPPeerSpec{
+							DynamicASN: "internal",
+						},
+					},
+				},
+			},
+			mustFail: true,
+		},
+		{
+			desc: "interface",
+			config: ClusterResources{
+				Peers: []v1beta2.BGPPeer{
+					{
+						Spec: v1beta2.BGPPeerSpec{
+							Interface: "eth0",
+						},
+					},
+				},
+			},
+			mustFail: true,
+		},
+		{
+			desc: "keepalive time",
+			config: ClusterResources{
+				Peers: []v1beta2.BGPPeer{
+					{
+						Spec: v1beta2.BGPPeerSpec{
+							KeepaliveTime: &v1.Duration{Duration: time.Second},
+						},
+					},
+				},
+			},
+			mustFail: true,
+		},
+		{
+			desc: "connect time",
+			config: ClusterResources{
+				Peers: []v1beta2.BGPPeer{
+					{
+						Spec: v1beta2.BGPPeerSpec{
+							ConnectTime: ptr.To(v1.Duration{Duration: time.Second}),
 						},
 					},
 				},
@@ -408,6 +555,46 @@ func TestValidateFRR(t *testing.T) {
 						Spec: v1beta2.BGPPeerSpec{
 							Address: "1.2.3.4",
 							VRFName: "red",
+						},
+					},
+				},
+			},
+			mustFail: true,
+		},
+		{
+			desc: "two peers with interface set different",
+			config: ClusterResources{
+				Peers: []v1beta2.BGPPeer{
+					{
+						Spec: v1beta2.BGPPeerSpec{
+							Interface: "eth0",
+							MyASN:     123,
+						},
+					},
+					{
+						Spec: v1beta2.BGPPeerSpec{
+							Interface: "eth1",
+							MyASN:     123,
+						},
+					},
+				},
+			},
+			mustFail: false,
+		},
+		{
+			desc: "two peers with interface set same",
+			config: ClusterResources{
+				Peers: []v1beta2.BGPPeer{
+					{
+						Spec: v1beta2.BGPPeerSpec{
+							Interface: "eth0",
+							MyASN:     123,
+						},
+					},
+					{
+						Spec: v1beta2.BGPPeerSpec{
+							Interface: "eth0",
+							MyASN:     123,
 						},
 					},
 				},

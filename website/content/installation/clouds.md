@@ -18,7 +18,6 @@ a pull request to update this list!
 | AWS            | No, use EKS                                                                                  |
 | Azure          | No, use AKS                                                                                  |
 | DigitalOcean   | No, use DigitalOcean Kubernetes                                                              |
-| Equinix Metal  | Yes, see [Equinix Metal notes]                                                               |
 | Google Cloud   | No, use GKE                                                                                  |
 | Hetzner        | Yes, see [Hetzner notes](https://community.hetzner.com/tutorials/install-kubernetes-cluster) |
 | OVH            | Yes, when using a vRack                                                                      |
@@ -31,7 +30,6 @@ a pull request to update this list!
 [use alternatives]: #alternatives
 [OpenShift notes]: #metallb-on-openshift-ocp
 [OpenStack notes]: #metallb-on-openstack
-[Equinix Metal notes]: #metallb-on-equinix-metal
 
 ## Why doesn't MetalLB work on (most) cloud platforms?
 
@@ -85,6 +83,9 @@ load balancers work. You can do this with:
 oc adm policy add-scc-to-user privileged -n metallb-system -z speaker
 ```
 
+Please note that if you are deploying MetalLB via helm, the ServiceAccount
+name is metallb-speaker.
+
 After that, MetalLB should work normally.
 
 ### MetalLB on OpenStack
@@ -99,15 +100,6 @@ OpenStack, because we're announcing IP addresses that OpenStack
 doesn't know about. There's currently no way to make OpenStack
 cooperate with MetalLB here, so we have to turn off the spoofing
 protection entirely.
-
-### MetalLB on Equinix Metal
-
-[Equinix Metal](https://metal.equinix.com) is an unusually "bare metal" cloud
-platform, and supports using BGP to advertise and route floating IPs to
-machines. As such, MetalLB's BGP mode works great on Equinix Metal! There is
-even a [tutorial](https://github.com/packet-labs/kubernetes-bgp) written by the
-folks at Equinix Metal, that use MetalLB to integrate Kubernetes load balancers
-with their BGP infrastructure.
 
 ## Alternatives
 

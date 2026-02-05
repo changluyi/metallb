@@ -9,7 +9,8 @@ METALLB_NS="${METALLB_NS:-metallb-system}"
 OUTPUT="./report"
 
 function get_metallb_crs() {
-    declare -a METALLB_CRDS=("addresspools" "bgppeers" "bfdprofiles" "bgpAdvertisements" "ipaddresspools" "l2advertisements" "communities")
+    declare -a METALLB_CRDS=("bgppeers" "bfdprofiles" "bgpAdvertisements" "ipaddresspools" 
+    "l2advertisements" "communities" "servicel2statuses" "servicebgpstatuses" "frrconfigurations" "frrnodestates")
     mkdir -p ${OUTPUT}/crds/
 
     for CRD in "${METALLB_CRDS[@]}"; do
@@ -18,7 +19,7 @@ function get_metallb_crs() {
 }
 
 function gather_frr_logs() {
-    declare -a FILES_TO_GATHER=("frr.conf" "frr.log" "daemons" "vtysh.conf")
+    declare -a FILES_TO_GATHER=("frr.conf" "daemons" "vtysh.conf")
     declare -a COMMANDS=("show running-config" "show bgp ipv4" "show bgp ipv6" "show bgp neighbor" "show bfd peer")
     LOGS_DIR="${OUTPUT}/pods/${1}/frr/logs"
     mkdir -p ${LOGS_DIR}

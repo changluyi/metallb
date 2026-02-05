@@ -77,10 +77,10 @@ currently have, relative to the top-level directory:
   Kubernetes apiserver to get and modify service information. It
   allows most of the rest of the MetalLB code to be ignorant of the
   Kubernetes client library, other than the objects (Service,
-  ConfigMap...) that they manipulate.
-- `internal/config` parses and validates the MetalLB configmap.
+  CRs...) that they manipulate.
+- `internal/config` parses and validates the MetalLB Custom Resources (e.g., IPAddressPool, L2Advertisement)
 - `internal/allocator` is the IP address manager. Given pools from the
-  MetalLB configmap, it can allocate addresses on demand.
+  IPAddressPool Custom Resource, it can allocate addresses on demand.
 - `internal/bgp/native` is a _very_ stripped down implementation of BGP. It
   speaks just enough of the protocol to keep peering sessions up, and
   to push routes to the peer.
@@ -116,7 +116,7 @@ To develop MetalLB, you'll need a couple of pieces of software:
   running system
 - [kind](https://github.com/kubernetes-sigs/kind), a lightweight Kubernetes cluster running in Docker
 - [Kubectl](https://kubernetes.io/docs/tasks/tools/install-kubectl/), the Kubernetes commandline interface
-- [Invoke](https://www.pyinvoke.org) to drive the build system
+- Install python dependencies with command `pip3 install -r dev-env/requirements.txt`
 
 >NOTE: The development environment was tested with **kind `v0.9.0`**. Older
 >versions may not work since there have been breaking changes between minor
@@ -170,7 +170,7 @@ us confident of the change.
 
 ## The website
 
-The website at <https://metallb.universe.tf> is pinned to the latest
+The website at <https://metallb.io> is pinned to the latest
 released version, so that users who don't care about ongoing
 development see documentation that is consistent with the released
 code.

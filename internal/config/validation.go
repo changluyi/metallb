@@ -3,12 +3,15 @@
 package config
 
 import (
+	"errors"
 	"fmt"
 
-	"github.com/pkg/errors"
+	metallbv1beta1 "go.universe.tf/metallb/api/v1beta1"
 	metallbv1beta2 "go.universe.tf/metallb/api/v1beta2"
 	"go.universe.tf/metallb/internal/bgp/community"
 	"go.universe.tf/metallb/internal/ipfamily"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 )
 
 type Validate func(ClusterResources) error
@@ -16,6 +19,8 @@ type Validate func(ClusterResources) error
 func ValidationFor(bgpImpl string) Validate {
 	switch bgpImpl {
 	case "frr":
+		return DiscardNativeOnly
+	case "frr-k8s":
 		return DiscardNativeOnly
 	case "native":
 		return DiscardFRROnly
@@ -30,11 +35,29 @@ func DiscardFRROnly(c ClusterResources) error {
 		if p.Spec.BFDProfile != "" {
 			return fmt.Errorf("peer %s has bfd-profile set on native bgp mode", p.Spec.Address)
 		}
-		if p.Spec.KeepaliveTime.Duration != 0 {
+		if p.Spec.KeepaliveTime != nil && p.Spec.KeepaliveTime.Duration != 0 {
 			return fmt.Errorf("peer %s has keepalive-time set on native bgp mode", p.Spec.Address)
 		}
 		if p.Spec.VRFName != "" {
 			return fmt.Errorf("peer %s has vrf set on native bgp mode", p.Spec.Address)
+		}
+		if p.Spec.ConnectTime != nil {
+			return fmt.Errorf("peer %s has connect time set on native bgp mode", p.Spec.Address)
+		}
+		if p.Spec.EnableGracefulRestart {
+			return fmt.Errorf("peer %s has EnableGracefulRestart flag set on native bgp mode", p.Spec.Address)
+		}
+		if p.Spec.DisableMP {
+			return fmt.Errorf("peer %s has disable MP flag set on native bgp mode", p.Spec.Address)
+		}
+		if p.Spec.DualStackAddressFamily {
+			return fmt.Errorf("peer %s has dualstackaddressfamily flag set on native bgp mode", p.Spec.Address)
+		}
+		if p.Spec.DynamicASN != "" {
+			return fmt.Errorf("peer %s has dynamicASN set on native bgp mode", p.Spec.Address)
+		}
+		if p.Spec.Interface != "" {
+			return fmt.Errorf("peer %s has interface set on native bgp mode", p.Spec.Address)
 		}
 	}
 	if len(c.BFDProfiles) > 0 {
@@ -54,7 +77,17 @@ func findIPv6BGPAdvertisement(c ClusterResources) error {
 	if len(c.BGPAdvs) == 0 {
 		return nil
 	}
+
+	bgpSelectors, err := poolSelectorsForBGP(c)
+	if err != nil {
+		return err
+	}
+
 	for _, p := range c.Pools {
+		if !bgpSelectors.matchesPool(p) {
+			continue
+		}
+
 		for _, cidr := range p.Spec.Addresses {
 			nets, err := ParseCIDR(cidr)
 			if err != nil {
@@ -73,21 +106,6 @@ func findIPv6BGPAdvertisement(c ClusterResources) error {
 // findNonLegacyCommunity returns an error if it can find a non legacy community. If a community string can not be
 // parsed, the string will be ignored.
 func findNonLegacyCommunity(c ClusterResources) error {
-	for _, p := range c.LegacyAddressPools {
-		for _, adv := range p.Spec.BGPAdvertisements {
-			for _, cs := range adv.Communities {
-				c, err := community.New(cs)
-				if err != nil {
-					// Skip aliases.
-					continue
-				}
-				if !community.IsLegacy(c) {
-					return fmt.Errorf("native BGP mode only supports legacy communities, legacy address pool %q "+
-						"has non legacy community %q", p.Name, cs)
-				}
-			}
-		}
-	}
 	for _, adv := range c.BGPAdvs {
 		for _, cs := range adv.Spec.Communities {
 			c, err := community.New(cs)
@@ -130,17 +148,17 @@ func DiscardNativeOnly(c ClusterResources) error {
 	if len(c.Peers) > 1 {
 		peerAddr := make(map[string]bool)
 		routerID := c.Peers[0].Spec.RouterID
-		peer0 := peerAddressKey(c.Peers[0].Spec)
+		peer0 := peerIdentifier(c.Peers[0].Spec)
 		peerAddr[peer0] = true
 		for _, p := range c.Peers[1:] {
 			if p.Spec.RouterID != routerID {
 				return fmt.Errorf("peer %s has RouterID different from %s, in FRR mode all RouterID must be equal", p.Spec.RouterID, c.Peers[0].Spec.RouterID)
 			}
-			peerKey := peerAddressKey(p.Spec)
-			if _, ok := peerAddr[peerKey]; ok {
+			peerID := peerIdentifier(p.Spec)
+			if _, ok := peerAddr[peerID]; ok {
 				return fmt.Errorf("peer %s already exists, FRR mode doesn't support duplicate BGPPeers", p.Spec.Address)
 			}
-			peerAddr[peerKey] = true
+			peerAddr[peerID] = true
 		}
 	}
 	for _, p := range c.Peers {
@@ -200,6 +218,56 @@ func hasBFDEcho(peer *Peer, bfdProfiles map[string]*BFDProfile) bool {
 	return false
 }
 
-func peerAddressKey(peer metallbv1beta2.BGPPeerSpec) string {
-	return fmt.Sprintf("%s-%s", peer.Address, peer.VRFName)
+func peerIdentifier(peer metallbv1beta2.BGPPeerSpec) string {
+	id := peer.Address
+	if peer.Address == "" {
+		id = peer.Interface
+	}
+	return fmt.Sprintf("%s-%s", id, peer.VRFName)
+}
+
+type poolSelector struct {
+	byName   map[string]struct{}
+	byLabels []labels.Selector
+}
+
+func (s poolSelector) matchesPool(p metallbv1beta1.IPAddressPool) bool {
+	if len(s.byLabels) == 0 && len(s.byName) == 0 {
+		return true
+	}
+
+	if _, ok := s.byName[p.Name]; ok {
+		return true
+	}
+	for _, l := range s.byLabels {
+		if l.Matches(labels.Set(p.Labels)) {
+			return true
+		}
+	}
+	return false
+}
+
+func poolSelectorsForBGP(c ClusterResources) (poolSelector, error) {
+	selectedPools := make(map[string]struct{})
+	poolsSelectors := []labels.Selector{}
+	for _, adv := range c.BGPAdvs {
+		if len(adv.Spec.IPAddressPools) == 0 &&
+			len(adv.Spec.IPAddressPoolSelectors) == 0 {
+			return poolSelector{}, nil // no selectors, let's catch em all!
+		}
+		for _, p := range adv.Spec.IPAddressPools {
+			selectedPools[p] = struct{}{}
+		}
+		for _, selector := range adv.Spec.IPAddressPoolSelectors {
+			l, err := metav1.LabelSelectorAsSelector(&selector)
+			if err != nil {
+				return poolSelector{}, fmt.Errorf("invalid label selector %v", selector)
+			}
+			poolsSelectors = append(poolsSelectors, l)
+		}
+	}
+	return poolSelector{
+		byName:   selectedPools,
+		byLabels: poolsSelectors,
+	}, nil
 }

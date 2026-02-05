@@ -63,3 +63,15 @@ func (i *IPAdvertisement) matchInterface(intf string) bool {
 	}
 	return i.interfaces.Has(intf)
 }
+func (i *IPAdvertisement) IsAllInterfaces() bool {
+	return i.allInterfaces
+}
+
+func (i *IPAdvertisement) GetInterfaces() sets.Set[string] {
+	return i.interfaces
+}
+
+// IP returns the IP address being advertised.
+func (i *IPAdvertisement) IP() net.IP {
+	return i.ip
+}

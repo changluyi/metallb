@@ -65,7 +65,7 @@ and IPV6 addresses
 - if the service asks for a specific IP, an IPAddressPool providing that IP exists and its selectors
 are compatible with the service
 - if the service asks for a specific IP used also by other services, make sure that they respect the
-sharing properties described in the [official docs](https://metallb.universe.tf/usage/#ip-address-sharing).
+sharing properties described in the [official docs](https://metallb.io/usage/#ip-address-sharing).
 
 ## Troubleshooting service advertisements
 
@@ -86,6 +86,13 @@ A given speaker won't advertise the service if:
 - the service has `externalTrafficPolicy=local` and there are no running endpoints on the speaker's node
 - there are no L2Advertisements / BGPAdvertisements matching the speaker node (if node selectors are specified)
 - the Kubernetes API reports "network not available" on the speaker's node
+
+## MetalLB is not advertising my service from my control-plane nodes or from my single node cluster
+
+Make sure your nodes are not labeled with the
+[node.kubernetes.io/exclude-from-external-load-balancers](https://kubernetes.io/docs/reference/labels-annotations-taints/#node-kubernetes-io-exclude-from-external-load-balancers) label.
+MetalLB honors that label and won't announce any service from such nodes. One way to circumvent
+the issue is to provide the speakers with the `--ignore-exclude-lb` flag (either from Helm or via Kustomize).
 
 ## MetalLB says it advertises the service but reaching the service does not work
 
@@ -147,6 +154,14 @@ in the logs of the speakers
 
 If the L2 interface selector is used but there are no compatible interfaces on the node elected, MetalLB will
 produce an event on the Service which should be visible when doing `kubectl describe svc <service-name>`.
+
+#### Using WiFi and can't reach the service?
+
+Some devices (such as Raspberry Pi) do not respond to ARP requests when using WiFi. This can lead to a situation where the service is initially reachable, but breaks shortly afterwards.
+At this stage attempting to arping will result in a timeout and the service will not be reachable.
+
+One workaround is to enable promiscuous mode on the interface: `sudo ifconfig <device> promisc`. For example: `sudo ifconfig wlan0 promisc`
+
 
 ### Checking if the BGP advertisement works
 
@@ -231,6 +246,29 @@ in the BGPAdvertisement / L2Advertisement) and to limit the service's endpoints 
 By doing this, the path of the traffic will be clear and it will be easy to understand if the issue
 is caused only by a subset of the nodes or when the pod lives on a different node, for example.
 
+#### MetalLB and asymmetric return path
+
+[Reverse path filtering](https://tldp.org/HOWTO/Adv-Routing-HOWTO/lartc.kernel.rpf.html) is a linux protection
+mechanism which causes packets that should not be coming from an interface to be dropped (i.e., there is no route to the ip of
+the client sending those packets through that interface).
+
+This is common with BGP (and less so with L2 mode) because MetalLB will advertise routes to the service but the nodes
+won't learn how to reach the client:
+
+- The client from a different subnet tries to reach the service exposed by MetalLB
+- The packets reach the node on an interface different from the default gateway
+- The node does not have a route back to the client through that interface
+
+Depending on the value of the `rp_filter` associated to the interface, the packets are dropped.
+
+There are several ways to solve this issue:
+
+- Add static routes to your node
+- Use the [frr-k8s variant](https://metallb.io/concepts/bgp/index.html#frr-k8s-mode) to let your fabric send those
+routes to the nodes
+- Use source based routing (or something that leverages that) to steer the reply traffic towards the right interface.
+This is the approach used by the [metallb node route agent](https://github.com/travisghansen/metallb-node-route-agent) (note that the project is not affiliated to metallb).
+
 ## Collecting information for a bug report
 
 If after following the suggestions of this guide, a MetalLB bug is the primary suspect, you need to file a
@@ -272,4 +310,12 @@ Additionally, the status of the service and of the endpoints must be provided:
 ```bash
 kubectl get endpointslices <my-service> -o yaml
 kubectl get svc <my_service> -o yaml
+```
+
+### How to debug the speaker and the controller containers
+
+Due to the fact that both the speaker and the controller containers are based on a distroless image, an ephemeral container should be used to debug inside them: 
+
+```bash
+kubectl debug -it -n metallb-system -c <ephemeral container name> --target=speaker --image=<ephemeral image name> <speaker pod>
 ```

@@ -29,4 +29,21 @@ const (
 	EndpointSlices
 )
 
-var errRetry = errors.New("event handling failed, retrying")
+const (
+	LabelAnnounceNode     = "metallb.io/node"
+	LabelServiceName      = "metallb.io/service-name"
+	LabelServiceNamespace = "metallb.io/service-namespace"
+)
+
+// Error types for condition reporting.
+const (
+	ErrorTypeConfiguration = "ConfigurationError"
+	ErrorTypeInfra         = "InfraError"
+	ErrorTypeNone          = "Reconciled"
+	ErrorTypeUnknown       = "UnknownError"
+)
+
+var (
+	ErrConfiguration = errors.New("configuration error")
+	errRetry         = errors.New("event handling failed, retrying")
+)

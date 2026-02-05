@@ -28,6 +28,10 @@ spec:
           valueFrom:
             fieldRef:
               fieldPath: spec.nodeName
+        - name: METALLB_POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
         - name: METALLB_HOST
           valueFrom:
             fieldRef:
@@ -78,6 +82,7 @@ spec:
           capabilities:
             add:
             - NET_RAW
+            - NET_ADMIN
             drop:
             - ALL
           readOnlyRootFilesystem: true

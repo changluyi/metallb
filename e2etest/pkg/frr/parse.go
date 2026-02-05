@@ -9,19 +9,29 @@ import (
 	"sort"
 	"strconv"
 
-	"github.com/pkg/errors"
+	"errors"
 )
 
 type Neighbor struct {
-	IP             net.IP
-	VRF            string
-	Connected      bool
-	LocalAS        string
-	RemoteAS       string
-	PrefixSent     int
-	Port           int
-	RemoteRouterID string
-	MsgStats       MessageStats
+	// ID is the key that vtysh returns for the neighbor,
+	// it can be either IP or interface name if unnumbered.
+	ID                      string
+	VRF                     string
+	Connected               bool
+	LocalAS                 string
+	RemoteAS                string
+	PrefixSent              int
+	Port                    int
+	RemoteRouterID          string
+	GRInfo                  GracefulRestartInfo
+	BFDInfo                 PeerBFDInfo
+	MsgStats                MessageStats
+	ConfiguredHoldTime      int
+	ConfiguredKeepAliveTime int
+	ConfiguredConnectTime   int
+	AddressFamilies         []string
+	ConnectionsDropped      int
+	BGPNeighborAddr         string
 }
 
 type Route struct {
@@ -29,22 +39,66 @@ type Route struct {
 	NextHops    []net.IP
 	LocalPref   uint32
 	Origin      string
+	Stale       bool
 }
 
 const bgpConnected = "Established"
 
 type FRRNeighbor struct {
-	RemoteAs          int          `json:"remoteAs"`
-	LocalAs           int          `json:"localAs"`
-	RemoteRouterID    string       `json:"remoteRouterId"`
-	BgpVersion        int          `json:"bgpVersion"`
-	BgpState          string       `json:"bgpState"`
-	PortForeign       int          `json:"portForeign"`
-	MsgStats          MessageStats `json:"messageStats"`
-	VRFName           string       `json:"vrf"`
-	AddressFamilyInfo map[string]struct {
+	BGPNeighborAddr              string              `json:"bgpNeighborAddr"`
+	RemoteAs                     int                 `json:"remoteAs"`
+	LocalAs                      int                 `json:"localAs"`
+	RemoteRouterID               string              `json:"remoteRouterId"`
+	BgpVersion                   int                 `json:"bgpVersion"`
+	BgpState                     string              `json:"bgpState"`
+	PortForeign                  int                 `json:"portForeign"`
+	MsgStats                     MessageStats        `json:"messageStats"`
+	GRInfo                       GracefulRestartInfo `json:"gracefulRestartInfo"`
+	PeerBFDInfo                  PeerBFDInfo         `json:"peerBfdInfo"`
+	VRFName                      string              `json:"vrf"`
+	ConfiguredHoldTimeMSecs      int                 `json:"bgpTimerConfiguredHoldTimeMsecs"`
+	ConfiguredKeepAliveTimeMSecs int                 `json:"bgpTimerConfiguredKeepAliveIntervalMsecs"`
+	ConnectRetryTimer            int                 `json:"connectRetryTimer"`
+	AddressFamilyInfo            map[string]struct {
 		SentPrefixCounter int `json:"sentPrefixCounter"`
 	} `json:"addressFamilyInfo"`
+	ConnectionsDropped int `json:"connectionsDropped"`
+}
+
+type PeerBFDInfo struct {
+	Type             string `json:"type"`
+	DetectMultiplier int    `json:"detectMultiplier"`
+	RxMinInterval    int    `json:"rxMinInterval"`
+	TxMinInterval    int    `json:"txMinInterval"`
+	Status           string `json:"status"`
+	LastUpdate       string `json:"lastUpdate"`
+}
+type GracefulRestartInfo struct {
+	EndOfRibSend struct {
+		Ipv4Unicast bool `json:"ipv4Unicast"`
+	} `json:"endOfRibSend"`
+	EndOfRibRecv struct {
+		Ipv4Unicast bool `json:"ipv4Unicast"`
+	} `json:"endOfRibRecv"`
+	LocalGrMode  string `json:"localGrMode"`
+	RemoteGrMode string `json:"remoteGrMode"`
+	RBit         bool   `json:"rBit"`
+	NBit         bool   `json:"nBit"`
+	Timers       struct {
+		ConfiguredRestartTimer int `json:"configuredRestartTimer"`
+		ReceivedRestartTimer   int `json:"receivedRestartTimer"`
+	} `json:"timers"`
+	Ipv4Unicast struct {
+		FBit           bool `json:"fBit"`
+		EndOfRibStatus struct {
+			EndOfRibSend            bool `json:"endOfRibSend"`
+			EndOfRibSentAfterUpdate bool `json:"endOfRibSentAfterUpdate"`
+			EndOfRibRecv            bool `json:"endOfRibRecv"`
+		} `json:"endOfRibStatus"`
+		Timers struct {
+			StalePathTimer int `json:"stalePathTimer"`
+		} `json:"timers"`
+	} `json:"ipv4Unicast"`
 }
 
 type MessageStats struct {
@@ -65,10 +119,12 @@ type IPInfo struct {
 }
 
 type FRRRoute struct {
+	Stale     bool   `json:"stale"`
 	Valid     bool   `json:"valid"`
 	PeerID    string `json:"peerId"`
 	LocalPref uint32 `json:"locPrf"`
 	Origin    string `json:"origin"`
+	PathFrom  string `json:"pathFrom"`
 	Nexthops  []struct {
 		IP    string `json:"ip"`
 		Scope string `json:"scope"`
@@ -106,7 +162,7 @@ func ParseNeighbour(vtyshRes string) (*Neighbor, error) {
 	res := map[string]FRRNeighbor{}
 	err := json.Unmarshal([]byte(vtyshRes), &res)
 	if err != nil {
-		return nil, errors.Wrap(err, "failed to parse vtysh response")
+		return nil, errors.Join(err, errors.New("failed to parse vtysh response"))
 	}
 	if len(res) > 1 {
 		return nil, errors.New("more than one peer were returned")
@@ -115,10 +171,6 @@ func ParseNeighbour(vtyshRes string) (*Neighbor, error) {
 		return nil, errors.New("no peers were returned")
 	}
 	for k, n := range res {
-		ip := net.ParseIP(k)
-		if ip == nil {
-			return nil, fmt.Errorf("failed to parse %s as ip", ip)
-		}
 		connected := true
 		if n.BgpState != bgpConnected {
 			connected = false
@@ -128,14 +180,18 @@ func ParseNeighbour(vtyshRes string) (*Neighbor, error) {
 			prefixSent += s.SentPrefixCounter
 		}
 		return &Neighbor{
-			IP:             ip,
-			Connected:      connected,
-			LocalAS:        strconv.Itoa(n.LocalAs),
-			RemoteAS:       strconv.Itoa(n.RemoteAs),
-			PrefixSent:     prefixSent,
-			Port:           n.PortForeign,
-			RemoteRouterID: n.RemoteRouterID,
-			MsgStats:       n.MsgStats,
+			ID:                      k,
+			Connected:               connected,
+			LocalAS:                 strconv.Itoa(n.LocalAs),
+			RemoteAS:                strconv.Itoa(n.RemoteAs),
+			PrefixSent:              prefixSent,
+			Port:                    n.PortForeign,
+			RemoteRouterID:          n.RemoteRouterID,
+			MsgStats:                n.MsgStats,
+			ConfiguredKeepAliveTime: n.ConfiguredKeepAliveTimeMSecs,
+			ConfiguredHoldTime:      n.ConfiguredHoldTimeMSecs,
+			ConnectionsDropped:      n.ConnectionsDropped,
+			BGPNeighborAddr:         n.BGPNeighborAddr,
 		}, nil
 	}
 	return nil, errors.New("no peers were returned")
@@ -147,32 +203,38 @@ func ParseNeighbours(vtyshRes string) ([]*Neighbor, error) {
 	toParse := map[string]FRRNeighbor{}
 	err := json.Unmarshal([]byte(vtyshRes), &toParse)
 	if err != nil {
-		return nil, errors.Wrap(err, "failed to parse vtysh response")
+		return nil, errors.Join(err, errors.New("failed to parse vtysh response"))
 	}
 
 	res := make([]*Neighbor, 0)
 	for k, n := range toParse {
-		ip := net.ParseIP(k)
-		if ip == nil {
-			return nil, fmt.Errorf("failed to parse %s as ip", ip)
-		}
 		connected := true
 		if n.BgpState != bgpConnected {
 			connected = false
 		}
+		var addressFamilies []string
 		prefixSent := 0
-		for _, s := range n.AddressFamilyInfo {
+		for family, s := range n.AddressFamilyInfo {
 			prefixSent += s.SentPrefixCounter
+			addressFamilies = append(addressFamilies, family)
 		}
 		res = append(res, &Neighbor{
-			IP:             ip,
-			Connected:      connected,
-			LocalAS:        strconv.Itoa(n.LocalAs),
-			RemoteAS:       strconv.Itoa(n.RemoteAs),
-			PrefixSent:     prefixSent,
-			Port:           n.PortForeign,
-			RemoteRouterID: n.RemoteRouterID,
-			MsgStats:       n.MsgStats,
+			ID:                      k,
+			Connected:               connected,
+			LocalAS:                 strconv.Itoa(n.LocalAs),
+			RemoteAS:                strconv.Itoa(n.RemoteAs),
+			PrefixSent:              prefixSent,
+			Port:                    n.PortForeign,
+			RemoteRouterID:          n.RemoteRouterID,
+			MsgStats:                n.MsgStats,
+			GRInfo:                  n.GRInfo,
+			BFDInfo:                 n.PeerBFDInfo,
+			ConfiguredKeepAliveTime: n.ConfiguredKeepAliveTimeMSecs,
+			ConfiguredHoldTime:      n.ConfiguredHoldTimeMSecs,
+			ConfiguredConnectTime:   n.ConnectRetryTimer,
+			AddressFamilies:         addressFamilies,
+			ConnectionsDropped:      n.ConnectionsDropped,
+			BGPNeighborAddr:         n.BGPNeighborAddr,
 		})
 	}
 	return res, nil
@@ -184,14 +246,14 @@ func ParseRoutes(vtyshRes string) (map[string]Route, error) {
 	toParse := IPInfo{}
 	err := json.Unmarshal([]byte(vtyshRes), &toParse)
 	if err != nil {
-		return nil, errors.Wrap(err, "failed to parse vtysh response")
+		return nil, errors.Join(err, errors.New("failed to parse vtysh response"))
 	}
 
 	res := make(map[string]Route)
 	for k, frrRoutes := range toParse.Routes {
 		destIP, dest, err := net.ParseCIDR(k)
 		if err != nil {
-			return nil, errors.Wrapf(err, "failed to parse cidr for %s", k)
+			return nil, errors.Join(err, fmt.Errorf("failed to parse cidr for %s", k))
 		}
 
 		r := Route{
@@ -201,6 +263,7 @@ func ParseRoutes(vtyshRes string) (map[string]Route, error) {
 		for _, n := range frrRoutes {
 			r.LocalPref = n.LocalPref
 			r.Origin = n.Origin
+			r.Stale = n.Stale
 		out:
 			for _, h := range n.Nexthops {
 				ip := net.ParseIP(h.IP)
@@ -227,7 +290,7 @@ func ParseBFDPeers(vtyshRes string) ([]BFDPeer, error) {
 	parseRes := []BFDPeer{}
 	err := json.Unmarshal([]byte(vtyshRes), &parseRes)
 	if err != nil {
-		return nil, errors.Wrap(err, "failed to parse vtysh response")
+		return nil, errors.Join(err, errors.New("failed to parse vtysh response"))
 	}
 	return parseRes, nil
 }
@@ -236,7 +299,7 @@ func ParseVRFs(vtyshRes string) ([]string, error) {
 	vrfs := map[string]interface{}{}
 	err := json.Unmarshal([]byte(vtyshRes), &vrfs)
 	if err != nil {
-		return nil, errors.Wrap(err, "parseVRFs: failed to parse vtysh response")
+		return nil, errors.Join(err, errors.New("parseVRFs: failed to parse vtysh response"))
 	}
 	res := make([]string, 0)
 	for v := range vrfs {

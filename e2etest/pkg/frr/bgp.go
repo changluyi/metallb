@@ -6,7 +6,8 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/pkg/errors"
+	"errors"
+
 	"go.universe.tf/e2etest/pkg/executor"
 
 	"go.universe.tf/e2etest/pkg/ipfamily"
@@ -16,33 +17,39 @@ import (
 // useful for fetching informations from FRR (such as metrics) and we may need to move it
 // to metallb.
 
-// NeighborForContainer returns informations for the given neighbor in the given
+// NeighborInfo returns informations for the given neighbor in the given
 // executor.
 func NeighborInfo(neighborName string, exec executor.Executor) (*Neighbor, error) {
 	res, err := exec.Exec("vtysh", "-c", fmt.Sprintf("show bgp neighbor %s json", neighborName))
 
 	if err != nil {
-		return nil, errors.Wrapf(err, "Failed to query neighbour %s", neighborName)
+		return nil, errors.Join(err, fmt.Errorf("Failed to query neighbour %s", neighborName))
 	}
 	neighbor, err := ParseNeighbour(res)
 	if err != nil {
-		return nil, errors.Wrapf(err, "Failed to parse neighbour %s", neighborName)
+		return nil, errors.Join(err, fmt.Errorf("Failed to parse neighbour %s", neighborName))
 	}
 	return neighbor, nil
 }
 
-// NeighborsForContainer returns informations for the all the neighbors in the given
+type NeighborsMap map[string]*Neighbor
+
+// NeighborsInfo returns informations for the all the neighbors in the given
 // executor.
-func NeighborsInfo(exec executor.Executor) ([]*Neighbor, error) {
-	res, err := exec.Exec("vtysh", "-c", "show bgp neighbor json")
+func NeighborsInfo(exec executor.Executor) (NeighborsMap, error) {
+	jsonRes, err := exec.Exec("vtysh", "-c", "show bgp neighbor json")
 	if err != nil {
-		return nil, errors.Wrapf(err, "Failed to query neighbours")
+		return nil, errors.Join(err, errors.New("Failed to query neighbours"))
 	}
-	neighbors, err := ParseNeighbours(res)
+	neighbors, err := ParseNeighbours(jsonRes)
 	if err != nil {
-		return nil, errors.Wrapf(err, "Failed to parse neighbours %s", res)
+		return nil, errors.Join(err, fmt.Errorf("Failed to parse neighbours %s", jsonRes))
 	}
-	return neighbors, nil
+	res := map[string]*Neighbor{}
+	for _, n := range neighbors {
+		res[n.ID] = n
+	}
+	return res, nil
 }
 
 // Routes returns informations about routes in the given executor
@@ -60,11 +67,11 @@ func RoutesForVRF(vrf string, exec executor.Executor) (map[string]Route, map[str
 	}
 	res, err := exec.Exec("vtysh", "-c", cmd)
 	if err != nil {
-		return nil, nil, errors.Wrapf(err, "Failed to query routes")
+		return nil, nil, errors.Join(err, errors.New("Failed to query routes"))
 	}
 	v4Routes, err := ParseRoutes(res)
 	if err != nil {
-		return nil, nil, errors.Wrapf(err, "Failed to parse routes %s", res)
+		return nil, nil, errors.Join(err, fmt.Errorf("Failed to parse routes %s", res))
 	}
 	cmd = "show bgp ipv6 json"
 	if vrf != "" {
@@ -72,11 +79,11 @@ func RoutesForVRF(vrf string, exec executor.Executor) (map[string]Route, map[str
 	}
 	res, err = exec.Exec("vtysh", "-c", cmd)
 	if err != nil {
-		return nil, nil, errors.Wrapf(err, "Failed to query routes")
+		return nil, nil, errors.Join(err, errors.New("Failed to query routes"))
 	}
 	v6Routes, err := ParseRoutes(res)
 	if err != nil {
-		return nil, nil, errors.Wrapf(err, "Failed to parse routes %s", res)
+		return nil, nil, errors.Join(err, fmt.Errorf("Failed to parse routes %s", res))
 	}
 	return v4Routes, v6Routes, nil
 }
@@ -115,12 +122,12 @@ func RoutesForCommunity(exec executor.Executor, communityString string, family i
 	for _, f := range families {
 		res, err := exec.Exec("vtysh", "-c", fmt.Sprintf("show bgp %s %s %s json", f, communityType, communityString))
 		if err != nil {
-			return nil, errors.Wrapf(err, "Failed to query routes for family %s %s %s", f, communityType, communityString)
+			return nil, errors.Join(err, fmt.Errorf("Failed to query routes for family %s %s %s", f, communityType, communityString))
 		}
 
 		r, err := ParseRoutes(res)
 		if err != nil {
-			return nil, errors.Wrapf(err, "Failed to parse routes %s", res)
+			return nil, errors.Join(err, fmt.Errorf("Failed to parse routes %s", res))
 		}
 
 		for k, v := range r {
@@ -145,11 +152,17 @@ func NeighborConnected(neighborJSON string) (bool, error) {
 // To be used for debugging in order to print the status of the frr instance.
 func RawDump(exec executor.Executor, filesToDump ...string) (string, error) {
 	allerrs := errors.New("")
-
-	res := "####### Show running config\n"
-	out, err := exec.Exec("vtysh", "-c", "show running-config")
+	res := "####### Show version\n"
+	out, err := exec.Exec("vtysh", "-c", "show version")
 	if err != nil {
-		allerrs = errors.Wrapf(allerrs, "\nFailed exec show bgp neighbor: %v", err)
+		allerrs = errors.Join(allerrs, fmt.Errorf("\nFailed exec show version: %v", err))
+	}
+	res += out
+
+	res += "####### Show running config\n"
+	out, err = exec.Exec("vtysh", "-c", "show running-config")
+	if err != nil {
+		allerrs = errors.Join(allerrs, fmt.Errorf("\nFailed exec show bgp neighbor: %v", err))
 	}
 	res += out
 
@@ -158,22 +171,36 @@ func RawDump(exec executor.Executor, filesToDump ...string) (string, error) {
 		// limiting the output to 500 lines:
 		out, err = exec.Exec("bash", "-c", fmt.Sprintf("cat %s | tail -n 500", file))
 		if err != nil {
-			allerrs = errors.Wrapf(allerrs, "\nFailed to cat file %s: %v", file, err)
+			allerrs = errors.Join(allerrs, fmt.Errorf("\nFailed to cat file %s: %v", file, err))
 		}
 		res += out
 	}
 
 	res += "####### BGP Neighbors\n"
-	out, err = exec.Exec("vtysh", "-c", "show bgp neighbor")
+	out, err = exec.Exec("vtysh", "-c", "show bgp vrf all neighbor")
 	if err != nil {
-		allerrs = errors.Wrapf(allerrs, "\nFailed exec show bgp neighbor: %v", err)
+		allerrs = errors.Join(allerrs, fmt.Errorf("\nFailed exec show bgp neighbor: %v", err))
+	}
+	res += out
+
+	res += "####### Routes\n"
+	out, err = exec.Exec("vtysh", "-c", "show bgp vrf all ipv4 json")
+	if err != nil {
+		allerrs = errors.Join(allerrs, fmt.Errorf("\nFailed exec show bgp ipv4: %v", err))
+	}
+	res += out
+
+	res += "####### Routes\n"
+	out, err = exec.Exec("vtysh", "-c", "show bgp vrf all ipv6 json")
+	if err != nil {
+		allerrs = errors.Join(allerrs, fmt.Errorf("\nFailed exec show bgp ipv6: %v", err))
 	}
 	res += out
 
 	res += "####### BFD Peers\n"
-	out, err = exec.Exec("vtysh", "-c", "show bfd peer")
+	out, err = exec.Exec("vtysh", "-c", "show bfd vrf all peer")
 	if err != nil {
-		allerrs = errors.Wrapf(allerrs, "\nFailed exec show bfd peer: %v", err)
+		allerrs = errors.Join(allerrs, fmt.Errorf("\nFailed exec show bfd peer: %v", err))
 	}
 	res += out
 
@@ -185,11 +212,26 @@ func RawDump(exec executor.Executor, filesToDump ...string) (string, error) {
 			res += fmt.Sprintf("####### Dumping crash file %s\n", file)
 			out, err = exec.Exec("bash", "-c", fmt.Sprintf("cat %s", file))
 			if err != nil {
-				allerrs = errors.Wrapf(allerrs, "\nFailed to cat bgpd crashinfo file %s: %v", file, err)
+				allerrs = errors.Join(allerrs, fmt.Errorf("\nFailed to cat bgpd crashinfo file %s: %v", file, err))
 			}
 			res += out
 		}
 	}
+
+	res += "####### Network setup for host\n"
+	res += "####### Routes\n"
+	out, err = exec.Exec("bash", "-c", "ip -6 route; ip -4 route")
+	if err != nil {
+		allerrs = errors.Join(allerrs, fmt.Errorf("\nFailed exec to print network setup: %v", err))
+	}
+	res += out
+
+	res += "####### Interfaces\n"
+	out, err = exec.Exec("bash", "-c", "ip address show; ip link show")
+	if err != nil {
+		allerrs = errors.Join(allerrs, fmt.Errorf("\nFailed exec to print network setup: %v", err))
+	}
+	res += out
 
 	if allerrs.Error() == "" {
 		allerrs = nil
@@ -205,7 +247,7 @@ func ContainsCommunity(exec executor.Executor, community string) error {
 		return err
 	}
 	if !strings.Contains(res, community) {
-		return errors.Wrapf(err, "show community %s doesn't include %s", res, community)
+		return errors.Join(err, fmt.Errorf("show community %s doesn't include %s", res, community))
 	}
 	return nil
 }

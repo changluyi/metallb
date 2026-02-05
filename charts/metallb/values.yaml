@@ -42,7 +42,7 @@ prometheus:
   # certificate to be used.
   controllerMetricsTLSSecret: ""
 
-  # prometheus doens't have the permission to scrape all namespaces so we give it permission to scrape metallb's one
+  # prometheus doesn't have the permission to scrape all namespaces so we give it permission to scrape metallb's one
   rbacPrometheus: true
 
   # the service account used by prometheus
@@ -64,7 +64,7 @@ prometheus:
     # enable support for Prometheus Operator
     enabled: false
 
-    # optional additionnal labels for podMonitors
+    # optional additional labels for podMonitors
     additionalLabels: {}
 
     # optional annotations for podMonitors
@@ -143,7 +143,7 @@ prometheus:
     # enable alertmanager alerts
     enabled: false
 
-    # optional additionnal labels for prometheusRules
+    # optional additional labels for prometheusRules
     additionalLabels: {}
 
     # optional annotations for prometheusRules
@@ -165,7 +165,9 @@ prometheus:
     addressPoolExhausted:
       enabled: true
       labels:
-        severity: alert
+        severity: critical
+      # Exclude the pools matching the regular expression from triggering the alert.
+      excludePools: ""
 
     addressPoolUsage:
       enabled: true
@@ -178,13 +180,15 @@ prometheus:
             severity: warning
         - percent: 95
           labels:
-            severity: alert
+            severity: critical
+      # Exclude the pools matching the regular expression from triggering the alert.
+      excludePools: ""
 
     # MetalLBBGPSessionDown
     bgpSessionDown:
       enabled: true
       labels:
-        severity: alert
+        severity: critical
 
     extraAlerts: []
 
@@ -195,7 +199,7 @@ controller:
   # -- Controller log level. Must be one of: `all`, `debug`, `info`, `warn`, `error` or `none`
   logLevel: info
   # command: /controller
-  # webhookMode: enabled
+  webhookMode: enabled
   image:
     repository: quay.io/metallb/controller
     tag:
@@ -248,6 +252,10 @@ controller:
     periodSeconds: 10
     successThreshold: 1
     timeoutSeconds: 1
+  tlsMinVersion: "VersionTLS12"
+  tlsCipherSuites: ""
+
+  extraContainers: []
 
 # speaker contains configuration specific to the MetalLB speaker
 # daemonset.
@@ -258,11 +266,16 @@ speaker:
   logLevel: info
   tolerateMaster: true
   memberlist:
+    # --  When enabled: false, the speaker pods must run on all nodes
     enabled: true
     mlBindPort: 7946
+    mlBindAddrOverride: ""
     mlSecretKeyPath: "/etc/ml_secret_key"
   excludeInterfaces:
     enabled: true
+  # ignore the exclude-from-external-loadbalancer label
+  ignoreExcludeLB: false
+
   image:
     repository: quay.io/metallb/speaker
     tag:
@@ -282,6 +295,7 @@ speaker:
     # true, a name is generated using the fullname template
     name: ""
     annotations: {}
+  securityContext: {}
   ## Defines a secret name for the controller to generate a memberlist encryption secret
   ## By default secretName: {{ "metallb.fullname" }}-memberlist
   ##
@@ -322,7 +336,7 @@ speaker:
     enabled: true
     image:
       repository: quay.io/frrouting/frr
-      tag: 8.5.2
+      tag: 10.4.1
       pullPolicy:
     metricsPort: 7473
     resources: {}
@@ -331,12 +345,43 @@ speaker:
     # expose the frr metrics via tls.
     # secureMetricsPort: 9121
 
+
   reloader:
     resources: {}
 
   frrMetrics:
     resources: {}
 
+  initContainers:
+    cpFrrFiles:
+      resources: {}
+    cpReloader:
+      resources: {}
+    cpMetrics:
+      resources: {}
+
+  extraContainers: []
+
 crds:
   enabled: true
   validationFailurePolicy: Fail
+
+# frrk8s contains the configuration related to using an frrk8s instance
+# (github.com/metallb/frr-k8s) as the backend for the BGP implementation.
+# This allows configuring additional frr parameters in combination to those
+# applied by MetalLB.
+frrk8s:
+  # if set, enables frrk8s as a backend. This is mutually exclusive to frr
+  # mode.
+  enabled: false
+  external: false
+  namespace: ""
+
+# networkpolicies
+networkpolicies:
+  # if set, networkpolicies for metallb components will be installed in the metallb namespace
+  enabled: false
+  # if set, a default deny network policy will be installed in the metallb namespace
+  defaultDeny: false
+  # to override internal k8s api targetPort
+  apiPort: 6443

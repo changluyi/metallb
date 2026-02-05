@@ -11,11 +11,11 @@ import (
 	"go.universe.tf/metallb/api/v1beta1"
 	"go.universe.tf/metallb/api/v1beta2"
 	"go.universe.tf/metallb/internal/bgp/community"
-	"go.universe.tf/metallb/internal/pointer"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/util/sets"
+	"k8s.io/utils/ptr"
 )
 
 func selector(s string) labels.Selector {
@@ -69,15 +69,17 @@ func TestParse(t *testing.T) {
 							Name: "peer1",
 						},
 						Spec: v1beta2.BGPPeerSpec{
-							MyASN:        42,
-							ASN:          142,
-							Address:      "1.2.3.4",
-							Port:         1179,
-							HoldTime:     metav1.Duration{Duration: 180 * time.Second},
-							RouterID:     "10.20.30.40",
-							SrcAddress:   "10.20.30.40",
-							EBGPMultiHop: true,
-							VRFName:      "foo",
+							MyASN:                 42,
+							ASN:                   142,
+							Address:               "1.2.3.4",
+							Port:                  1179,
+							HoldTime:              ptr.To(metav1.Duration{Duration: 180 * time.Second}),
+							ConnectTime:           ptr.To(metav1.Duration{Duration: time.Second}),
+							RouterID:              "10.20.30.40",
+							SrcAddress:            "10.20.30.40",
+							EnableGracefulRestart: true,
+							EBGPMultiHop:          true,
+							VRFName:               "foo",
 						},
 					},
 					{
@@ -85,10 +87,12 @@ func TestParse(t *testing.T) {
 							Name: "peer2",
 						},
 						Spec: v1beta2.BGPPeerSpec{
-							MyASN:        100,
-							ASN:          200,
-							Address:      "2.3.4.5",
-							EBGPMultiHop: false,
+							MyASN:                 100,
+							ASN:                   200,
+							Address:               "2.3.4.5",
+							EnableGracefulRestart: false,
+							EBGPMultiHop:          false,
+							ConnectTime:           ptr.To(metav1.Duration{Duration: time.Second}),
 							NodeSelectors: []metav1.LabelSelector{
 								{
 									MatchLabels: map[string]string{
@@ -117,7 +121,7 @@ func TestParse(t *testing.T) {
 								"10.50.0.0/24",
 							},
 							AvoidBuggyIPs: true,
-							AutoAssign:    pointer.BoolPtr(false),
+							AutoAssign:    ptr.To(false),
 						},
 					},
 					{
@@ -160,7 +164,7 @@ func TestParse(t *testing.T) {
 							Name: "adv1",
 						},
 						Spec: v1beta1.BGPAdvertisementSpec{
-							AggregationLength: pointer.Int32Ptr(32),
+							AggregationLength: ptr.To[int32](32),
 							LocalPref:         uint32(100),
 							Communities:       []string{"bar"},
 							IPAddressPools:    []string{"pool1"},
@@ -172,8 +176,8 @@ func TestParse(t *testing.T) {
 							Name: "adv2",
 						},
 						Spec: v1beta1.BGPAdvertisementSpec{
-							AggregationLength:   pointer.Int32Ptr(24),
-							AggregationLengthV6: pointer.Int32Ptr(64),
+							AggregationLength:   ptr.To[int32](24),
+							AggregationLengthV6: ptr.To[int32](64),
 							IPAddressPools:      []string{"pool1"},
 						},
 					},
@@ -220,28 +224,30 @@ func TestParse(t *testing.T) {
 			want: &Config{
 				Peers: map[string]*Peer{
 					"peer1": {
-						Name:          "peer1",
-						MyASN:         42,
-						ASN:           142,
-						Addr:          net.ParseIP("1.2.3.4"),
-						SrcAddr:       net.ParseIP("10.20.30.40"),
-						Port:          1179,
-						HoldTime:      180 * time.Second,
-						KeepaliveTime: 60 * time.Second,
-						RouterID:      net.ParseIP("10.20.30.40"),
-						NodeSelectors: []labels.Selector{labels.Everything()},
-						EBGPMultiHop:  true,
-						VRF:           "foo",
+						Name:                  "peer1",
+						MyASN:                 42,
+						ASN:                   142,
+						Addr:                  net.ParseIP("1.2.3.4"),
+						SrcAddr:               net.ParseIP("10.20.30.40"),
+						Port:                  1179,
+						HoldTime:              ptr.To(180 * time.Second),
+						KeepaliveTime:         ptr.To(60 * time.Second),
+						ConnectTime:           ptr.To(time.Second),
+						RouterID:              net.ParseIP("10.20.30.40"),
+						NodeSelectors:         []labels.Selector{labels.Everything()},
+						EnableGracefulRestart: true,
+						EBGPMultiHop:          true,
+						VRF:                   "foo",
 					},
 					"peer2": {
-						Name:          "peer2",
-						MyASN:         100,
-						ASN:           200,
-						Addr:          net.ParseIP("2.3.4.5"),
-						HoldTime:      90 * time.Second,
-						KeepaliveTime: 30 * time.Second,
-						NodeSelectors: []labels.Selector{selector("bar in (quux),foo=bar")},
-						EBGPMultiHop:  false,
+						Name:                  "peer2",
+						MyASN:                 100,
+						ASN:                   200,
+						Addr:                  net.ParseIP("2.3.4.5"),
+						ConnectTime:           ptr.To(time.Second),
+						NodeSelectors:         []labels.Selector{selector("bar in (quux),foo=bar")},
+						EnableGracefulRestart: false,
+						EBGPMultiHop:          false,
 					},
 				},
 				Pools: &Pools{ByName: map[string]*Pool{
@@ -346,7 +352,7 @@ func TestParse(t *testing.T) {
 								"10.50.0.0/24",
 							},
 							AvoidBuggyIPs: true,
-							AutoAssign:    pointer.BoolPtr(false),
+							AutoAssign:    ptr.To(false),
 							AllocateTo: &v1beta1.ServiceAllocation{Priority: 1,
 								Namespaces: []string{"test-ns1"}},
 						},
@@ -433,7 +439,7 @@ func TestParse(t *testing.T) {
 								"10.50.0.0/24",
 							},
 							AvoidBuggyIPs: true,
-							AutoAssign:    pointer.BoolPtr(false),
+							AutoAssign:    ptr.To(false),
 							AllocateTo: &v1beta1.ServiceAllocation{Priority: 1,
 								Namespaces: []string{"test-ns1", "test-ns1"}},
 						},
@@ -463,7 +469,7 @@ func TestParse(t *testing.T) {
 								"10.50.0.0/24",
 							},
 							AvoidBuggyIPs: true,
-							AutoAssign:    pointer.BoolPtr(false),
+							AutoAssign:    ptr.To(false),
 							AllocateTo: &v1beta1.ServiceAllocation{
 								Priority: 1,
 								NamespaceSelectors: []metav1.LabelSelector{{MatchLabels: map[string]string{"foo": "bar"}},
@@ -630,6 +636,44 @@ func TestParse(t *testing.T) {
 		},
 
 		{
+			desc: "ip address pool with only priority",
+			crs: ClusterResources{
+				Pools: []v1beta1.IPAddressPool{
+					{
+						ObjectMeta: metav1.ObjectMeta{
+							Name: "pool1",
+						},
+						Spec: v1beta1.IPAddressPoolSpec{
+							Addresses: []string{
+								"10.20.0.0/16",
+								"10.50.0.0/24",
+							},
+							AvoidBuggyIPs: true,
+							AutoAssign:    ptr.To(false),
+							AllocateTo:    &v1beta1.ServiceAllocation{Priority: 1},
+						},
+					},
+				},
+			},
+			want: &Config{
+				Pools: &Pools{
+					ByName: map[string]*Pool{
+						"pool1": {
+							Name:               "pool1",
+							CIDR:               []*net.IPNet{ipnet("10.20.0.0/16"), ipnet("10.50.0.0/24")},
+							AvoidBuggyIPs:      true,
+							AutoAssign:         false,
+							ServiceAllocations: &ServiceAllocation{Priority: 1, ServiceSelectors: []labels.Selector{labels.Everything()}},
+						},
+					},
+					ByServiceSelector: []string{"pool1"},
+				},
+				BFDProfiles: map[string]*BFDProfile{},
+				Peers:       map[string]*Peer{},
+			},
+		},
+
+		{
 			desc: "peer-only",
 			crs: ClusterResources{
 
@@ -653,8 +697,6 @@ func TestParse(t *testing.T) {
 						MyASN:         42,
 						ASN:           42,
 						Addr:          net.ParseIP("1.2.3.4"),
-						HoldTime:      90 * time.Second,
-						KeepaliveTime: 30 * time.Second,
 						NodeSelectors: []labels.Selector{labels.Everything()},
 						EBGPMultiHop:  false,
 					},
@@ -721,6 +763,23 @@ func TestParse(t *testing.T) {
 			},
 		},
 		{
+			desc: "invalid keepalivetime larger than holdtime",
+			crs: ClusterResources{
+				Peers: []v1beta2.BGPPeer{
+					{
+						Spec: v1beta2.BGPPeerSpec{
+							MyASN:         42,
+							ASN:           42,
+							Address:       "1.2.3.4",
+							HoldTime:      ptr.To(metav1.Duration{Duration: 30 * time.Second}),
+							KeepaliveTime: ptr.To(metav1.Duration{Duration: 90 * time.Second}),
+						},
+					},
+				},
+			},
+		},
+
+		{
 			desc: "invalid hold time (too short)",
 			crs: ClusterResources{
 				Peers: []v1beta2.BGPPeer{
@@ -729,10 +788,148 @@ func TestParse(t *testing.T) {
 							MyASN:    42,
 							ASN:      42,
 							Address:  "1.2.3.4",
-							HoldTime: metav1.Duration{Duration: time.Second},
+							HoldTime: ptr.To(metav1.Duration{Duration: time.Second}),
 						},
 					},
 				},
+			},
+		},
+		{
+			desc: "peer with holdtime only",
+			crs: ClusterResources{
+
+				Peers: []v1beta2.BGPPeer{
+					{
+						ObjectMeta: metav1.ObjectMeta{
+							Name: "peer1",
+						},
+						Spec: v1beta2.BGPPeerSpec{
+							MyASN:    42,
+							ASN:      42,
+							Address:  "1.2.3.4",
+							HoldTime: ptr.To(metav1.Duration{Duration: 180 * time.Second}),
+						},
+					},
+				},
+			},
+			want: &Config{
+				Peers: map[string]*Peer{
+					"peer1": {
+						Name:          "peer1",
+						MyASN:         42,
+						ASN:           42,
+						HoldTime:      ptr.To(180 * time.Second),
+						KeepaliveTime: ptr.To(60 * time.Second),
+						Addr:          net.ParseIP("1.2.3.4"),
+						NodeSelectors: []labels.Selector{labels.Everything()},
+						EBGPMultiHop:  false,
+					},
+				},
+				Pools:       &Pools{ByName: map[string]*Pool{}},
+				BFDProfiles: map[string]*BFDProfile{},
+			},
+		},
+		{
+			desc: "peer with keepalive only",
+			crs: ClusterResources{
+
+				Peers: []v1beta2.BGPPeer{
+					{
+						ObjectMeta: metav1.ObjectMeta{
+							Name: "peer1",
+						},
+						Spec: v1beta2.BGPPeerSpec{
+							MyASN:         42,
+							ASN:           42,
+							Address:       "1.2.3.4",
+							KeepaliveTime: ptr.To(metav1.Duration{Duration: 60 * time.Second}),
+						},
+					},
+				},
+			},
+			want: &Config{
+				Peers: map[string]*Peer{
+					"peer1": {
+						Name:          "peer1",
+						MyASN:         42,
+						ASN:           42,
+						HoldTime:      ptr.To(180 * time.Second),
+						KeepaliveTime: ptr.To(60 * time.Second),
+						Addr:          net.ParseIP("1.2.3.4"),
+						NodeSelectors: []labels.Selector{labels.Everything()},
+						EBGPMultiHop:  false,
+					},
+				},
+				Pools:       &Pools{ByName: map[string]*Pool{}},
+				BFDProfiles: map[string]*BFDProfile{},
+			},
+		},
+		{
+			desc: "peer with zero hold/keepalive timers",
+			crs: ClusterResources{
+
+				Peers: []v1beta2.BGPPeer{
+					{
+						ObjectMeta: metav1.ObjectMeta{
+							Name: "peer1",
+						},
+						Spec: v1beta2.BGPPeerSpec{
+							MyASN:         42,
+							ASN:           42,
+							Address:       "1.2.3.4",
+							HoldTime:      ptr.To(metav1.Duration{Duration: 0 * time.Second}),
+							KeepaliveTime: ptr.To(metav1.Duration{Duration: 0 * time.Second}),
+						},
+					},
+				},
+			},
+			want: &Config{
+				Peers: map[string]*Peer{
+					"peer1": {
+						Name:          "peer1",
+						MyASN:         42,
+						ASN:           42,
+						HoldTime:      ptr.To(0 * time.Second),
+						KeepaliveTime: ptr.To(0 * time.Second),
+						Addr:          net.ParseIP("1.2.3.4"),
+						NodeSelectors: []labels.Selector{labels.Everything()},
+						EBGPMultiHop:  false,
+					},
+				},
+				Pools:       &Pools{ByName: map[string]*Pool{}},
+				BFDProfiles: map[string]*BFDProfile{},
+			},
+		},
+		{
+			desc: "peer without hold/keepalive timers",
+			crs: ClusterResources{
+
+				Peers: []v1beta2.BGPPeer{
+					{
+						ObjectMeta: metav1.ObjectMeta{
+							Name: "peer1",
+						},
+						Spec: v1beta2.BGPPeerSpec{
+							MyASN:   42,
+							ASN:     42,
+							Address: "1.2.3.4",
+						},
+					},
+				},
+			},
+			want: &Config{
+				Peers: map[string]*Peer{
+					"peer1": {
+						Name:          "peer1",
+						MyASN:         42,
+						ASN:           42,
+						Addr:          net.ParseIP("1.2.3.4"),
+						NodeSelectors: []labels.Selector{labels.Everything()},
+						EBGPMultiHop:  false,
+					},
+				},
+				Pools:       &Pools{ByName: map[string]*Pool{}},
+				BFDProfiles: map[string]*BFDProfile{},
 			},
 		},
 		{
@@ -773,8 +970,6 @@ func TestParse(t *testing.T) {
 						MyASN:         42,
 						ASN:           42,
 						Addr:          net.ParseIP("1.2.3.4"),
-						HoldTime:      90 * time.Second,
-						KeepaliveTime: 30 * time.Second,
 						NodeSelectors: []labels.Selector{labels.Everything()},
 					},
 				},
@@ -1091,7 +1286,7 @@ func TestParse(t *testing.T) {
 				BGPAdvs: []v1beta1.BGPAdvertisement{
 					{
 						Spec: v1beta1.BGPAdvertisementSpec{
-							AggregationLength: pointer.Int32Ptr(34),
+							AggregationLength: ptr.To[int32](34),
 						},
 					},
 				},
@@ -1114,7 +1309,7 @@ func TestParse(t *testing.T) {
 				BGPAdvs: []v1beta1.BGPAdvertisement{
 					{
 						Spec: v1beta1.BGPAdvertisementSpec{
-							AggregationLength: pointer.Int32Ptr(26),
+							AggregationLength: ptr.To[int32](26),
 						},
 					},
 				},
@@ -1188,7 +1383,7 @@ func TestParse(t *testing.T) {
 					{
 						Spec: v1beta1.BGPAdvertisementSpec{
 							LocalPref:         100,
-							AggregationLength: pointer.Int32Ptr(24),
+							AggregationLength: ptr.To[int32](24),
 						},
 					},
 					{
@@ -1198,7 +1393,37 @@ func TestParse(t *testing.T) {
 					},
 				},
 			},
+			want: &Config{
+				Pools: &Pools{ByName: map[string]*Pool{
+					"pool1": {
+						Name:       "pool1",
+						AutoAssign: true,
+						CIDR: []*net.IPNet{
+							ipnet("10.20.30.40/24"),
+						},
+						BGPAdvertisements: []*BGPAdvertisement{
+							{
+								AggregationLength:   24,
+								AggregationLengthV6: 128,
+								LocalPref:           100,
+								Communities:         map[community.BGPCommunity]bool{},
+								Nodes:               map[string]bool{"node1": true, "node2": true},
+							},
+							{
+								AggregationLength:   32,
+								AggregationLengthV6: 128,
+								LocalPref:           200,
+								Communities:         map[community.BGPCommunity]bool{},
+								Nodes:               map[string]bool{"node1": true, "node2": true},
+							},
+						},
+					},
+				}},
+				BFDProfiles: map[string]*BFDProfile{},
+				Peers:       map[string]*Peer{},
+			},
 		},
+
 		{
 			desc: "different local pref - different aggregation lengths",
 			crs: ClusterResources{
@@ -1228,8 +1453,8 @@ func TestParse(t *testing.T) {
 					{
 						Spec: v1beta1.BGPAdvertisementSpec{
 							LocalPref:           100,
-							AggregationLength:   pointer.Int32Ptr(24),
-							AggregationLengthV6: pointer.Int32Ptr(120),
+							AggregationLength:   ptr.To[int32](24),
+							AggregationLengthV6: ptr.To[int32](120),
 						},
 					},
 					{
@@ -1437,7 +1662,7 @@ func TestParse(t *testing.T) {
 				BGPAdvs: []v1beta1.BGPAdvertisement{
 					{
 						Spec: v1beta1.BGPAdvertisementSpec{
-							AggregationLength: pointer.Int32Ptr(26),
+							AggregationLength: ptr.To[int32](26),
 						},
 					},
 				},
@@ -1492,7 +1717,7 @@ func TestParse(t *testing.T) {
 				BGPAdvs: []v1beta1.BGPAdvertisement{
 					{
 						Spec: v1beta1.BGPAdvertisementSpec{
-							AggregationLength: pointer.Int32Ptr(24),
+							AggregationLength: ptr.To[int32](24),
 						},
 					},
 				},
@@ -1860,8 +2085,6 @@ func TestParse(t *testing.T) {
 						MyASN:         42,
 						ASN:           42,
 						Addr:          net.ParseIP("1.2.3.4"),
-						HoldTime:      90 * time.Second,
-						KeepaliveTime: 30 * time.Second,
 						NodeSelectors: []labels.Selector{labels.Everything()},
 						BFDProfile:    "default",
 					},
@@ -1970,16 +2193,18 @@ func TestParse(t *testing.T) {
 			want: &Config{
 				Peers: map[string]*Peer{
 					"peer1": {
-						Name:          "peer1",
-						MyASN:         42,
-						ASN:           42,
-						Addr:          net.ParseIP("1.2.3.4"),
-						Port:          179,
-						HoldTime:      90 * time.Second,
-						KeepaliveTime: 30 * time.Second,
-						NodeSelectors: []labels.Selector{labels.Everything()},
-						BFDProfile:    "",
-						Password:      "nopass",
+						Name:           "peer1",
+						MyASN:          42,
+						ASN:            42,
+						Addr:           net.ParseIP("1.2.3.4"),
+						Port:           179,
+						NodeSelectors:  []labels.Selector{labels.Everything()},
+						BFDProfile:     "",
+						SecretPassword: "nopass",
+						PasswordRef: corev1.SecretReference{
+							Name:      "bgpsecret",
+							Namespace: "metallb-system",
+						},
 					},
 				},
 				Pools:       &Pools{ByName: map[string]*Pool{}},
@@ -2091,13 +2316,13 @@ func TestParse(t *testing.T) {
 							Name: "nondefault",
 						},
 						Spec: v1beta1.BFDProfileSpec{
-							ReceiveInterval:  pointer.Uint32Ptr(50),
-							TransmitInterval: pointer.Uint32Ptr(51),
-							DetectMultiplier: pointer.Uint32Ptr(52),
-							EchoInterval:     pointer.Uint32Ptr(54),
-							EchoMode:         pointer.BoolPtr(true),
-							PassiveMode:      pointer.BoolPtr(true),
-							MinimumTTL:       pointer.Uint32Ptr(55),
+							ReceiveInterval:  ptr.To(uint32(50)),
+							TransmitInterval: ptr.To(uint32(51)),
+							DetectMultiplier: ptr.To(uint32(52)),
+							EchoInterval:     ptr.To(uint32(54)),
+							EchoMode:         ptr.To(true),
+							PassiveMode:      ptr.To(true),
+							MinimumTTL:       ptr.To(uint32(55)),
 						},
 					},
 				},
@@ -2129,11 +2354,11 @@ func TestParse(t *testing.T) {
 				BFDProfiles: map[string]*BFDProfile{
 					"nondefault": {
 						Name:             "nondefault",
-						ReceiveInterval:  pointer.Uint32Ptr(50),
-						DetectMultiplier: pointer.Uint32Ptr(52),
-						TransmitInterval: pointer.Uint32Ptr(51),
-						EchoInterval:     pointer.Uint32Ptr(54),
-						MinimumTTL:       pointer.Uint32Ptr(55),
+						ReceiveInterval:  ptr.To(uint32(50)),
+						DetectMultiplier: ptr.To(uint32(52)),
+						TransmitInterval: ptr.To(uint32(51)),
+						EchoInterval:     ptr.To(uint32(54)),
+						MinimumTTL:       ptr.To(uint32(55)),
 						EchoMode:         true,
 						PassiveMode:      true,
 					},
@@ -2151,7 +2376,7 @@ func TestParse(t *testing.T) {
 							Name: "default",
 						},
 						Spec: v1beta1.BFDProfileSpec{
-							ReceiveInterval: pointer.Uint32Ptr(2),
+							ReceiveInterval: ptr.To(uint32(2)),
 						},
 					},
 				},
@@ -2167,7 +2392,7 @@ func TestParse(t *testing.T) {
 							Name: "default",
 						},
 						Spec: v1beta1.BFDProfileSpec{
-							ReceiveInterval: pointer.Uint32Ptr(90000),
+							ReceiveInterval: ptr.To(uint32(90000)),
 						},
 					},
 				},
@@ -2194,13 +2419,13 @@ func TestParse(t *testing.T) {
 							Name: "nondefault",
 						},
 						Spec: v1beta1.BFDProfileSpec{
-							ReceiveInterval:  pointer.Uint32Ptr(50),
-							TransmitInterval: pointer.Uint32Ptr(51),
-							DetectMultiplier: pointer.Uint32Ptr(52),
-							EchoInterval:     pointer.Uint32Ptr(54),
-							EchoMode:         pointer.BoolPtr(true),
-							PassiveMode:      pointer.BoolPtr(true),
-							MinimumTTL:       pointer.Uint32Ptr(55),
+							ReceiveInterval:  ptr.To(uint32(50)),
+							TransmitInterval: ptr.To(uint32(51)),
+							DetectMultiplier: ptr.To(uint32(52)),
+							EchoInterval:     ptr.To(uint32(54)),
+							EchoMode:         ptr.To(true),
+							PassiveMode:      ptr.To(true),
+							MinimumTTL:       ptr.To(uint32(55)),
 						},
 					},
 				},
@@ -2221,7 +2446,7 @@ func TestParse(t *testing.T) {
 							ASN:          142,
 							Address:      "1.2.3.4",
 							Port:         1179,
-							HoldTime:     metav1.Duration{Duration: 180 * time.Second},
+							HoldTime:     ptr.To(metav1.Duration{Duration: 180 * time.Second}),
 							RouterID:     "10.20.30.40",
 							SrcAddress:   "10.20.30.40",
 							EBGPMultiHop: true,
@@ -2252,7 +2477,7 @@ func TestParse(t *testing.T) {
 							Name: "with-echo",
 						},
 						Spec: v1beta1.BFDProfileSpec{
-							EchoMode: pointer.BoolPtr(true),
+							EchoMode: ptr.To(true),
 						},
 					},
 				},
@@ -2286,8 +2511,6 @@ func TestParse(t *testing.T) {
 						ASN:           142,
 						Addr:          net.ParseIP("1.2.3.4"),
 						Port:          1179,
-						HoldTime:      90 * time.Second,
-						KeepaliveTime: 30 * time.Second,
 						NodeSelectors: []labels.Selector{labels.Everything()},
 						BFDProfile:    "with-echo"},
 				},
@@ -2316,225 +2539,6 @@ func TestParse(t *testing.T) {
 			},
 		},
 		{
-			desc: "config mixing legacy pools with IP pools",
-			crs: ClusterResources{
-				Peers: []v1beta2.BGPPeer{
-					{
-						ObjectMeta: metav1.ObjectMeta{
-							Name: "peer1",
-						},
-						Spec: v1beta2.BGPPeerSpec{
-							MyASN:        42,
-							ASN:          142,
-							Address:      "1.2.3.4",
-							Port:         1179,
-							HoldTime:     metav1.Duration{Duration: 180 * time.Second},
-							RouterID:     "10.20.30.40",
-							SrcAddress:   "10.20.30.40",
-							EBGPMultiHop: true,
-						},
-					},
-				},
-				Pools: []v1beta1.IPAddressPool{
-					{
-						ObjectMeta: metav1.ObjectMeta{
-							Name: "pool1",
-						},
-						Spec: v1beta1.IPAddressPoolSpec{
-							Addresses: []string{
-								"10.20.0.0/16",
-								"10.50.0.0/24",
-							},
-							AvoidBuggyIPs: true,
-							AutoAssign:    pointer.BoolPtr(false),
-						},
-					},
-				},
-				LegacyAddressPools: []v1beta1.AddressPool{
-					{
-						ObjectMeta: metav1.ObjectMeta{
-							Name: "legacyl2pool1",
-						},
-						Spec: v1beta1.AddressPoolSpec{
-							Addresses: []string{
-								"10.21.0.0/16",
-								"10.51.0.0/24",
-							},
-							Protocol:   string(Layer2),
-							AutoAssign: pointer.BoolPtr(false),
-						},
-					},
-					{
-						ObjectMeta: metav1.ObjectMeta{
-							Name: "legacybgppool1",
-						},
-						Spec: v1beta1.AddressPoolSpec{
-							Addresses: []string{
-								"10.40.0.0/16",
-								"10.60.0.0/24",
-							},
-							Protocol:   string(BGP),
-							AutoAssign: pointer.BoolPtr(false),
-							BGPAdvertisements: []v1beta1.LegacyBgpAdvertisement{
-								{
-									AggregationLength: pointer.Int32Ptr(32),
-									LocalPref:         uint32(100),
-									Communities:       []string{"1234:2345"},
-								},
-							},
-						},
-					},
-				},
-				BGPAdvs: []v1beta1.BGPAdvertisement{
-					{
-						ObjectMeta: metav1.ObjectMeta{
-							Name: "adv1",
-						},
-						Spec: v1beta1.BGPAdvertisementSpec{
-							AggregationLength: pointer.Int32Ptr(32),
-							LocalPref:         uint32(100),
-							Communities:       []string{"1234:2345"},
-							IPAddressPools:    []string{"pool1"},
-						},
-					},
-				},
-			},
-			want: &Config{
-				Peers: map[string]*Peer{
-					"peer1": {
-						Name:          "peer1",
-						MyASN:         42,
-						ASN:           142,
-						Addr:          net.ParseIP("1.2.3.4"),
-						SrcAddr:       net.ParseIP("10.20.30.40"),
-						Port:          1179,
-						HoldTime:      180 * time.Second,
-						KeepaliveTime: 60 * time.Second,
-						RouterID:      net.ParseIP("10.20.30.40"),
-						NodeSelectors: []labels.Selector{labels.Everything()},
-						EBGPMultiHop:  true,
-					},
-				},
-				Pools: &Pools{ByName: map[string]*Pool{
-					"pool1": {
-						Name:          "pool1",
-						CIDR:          []*net.IPNet{ipnet("10.20.0.0/16"), ipnet("10.50.0.0/24")},
-						AvoidBuggyIPs: true,
-						AutoAssign:    false,
-						BGPAdvertisements: []*BGPAdvertisement{
-							{
-								Name:                "adv1",
-								AggregationLength:   32,
-								AggregationLengthV6: 128,
-								LocalPref:           100,
-								Communities: func() map[community.BGPCommunity]bool {
-									c, _ := community.New("1234:2345")
-									return map[community.BGPCommunity]bool{
-										c: true,
-									}
-								}(),
-								Nodes: map[string]bool{},
-							},
-						},
-					},
-					"legacybgppool1": {
-						Name: "legacybgppool1",
-						CIDR: []*net.IPNet{ipnet("10.40.0.0/16"), ipnet("10.60.0.0/24")},
-						BGPAdvertisements: []*BGPAdvertisement{
-							{
-								AggregationLength:   32,
-								AggregationLengthV6: 128,
-								LocalPref:           100,
-								Communities: func() map[community.BGPCommunity]bool {
-									c, _ := community.New("1234:2345")
-									return map[community.BGPCommunity]bool{
-										c: true,
-									}
-								}(),
-								Nodes: map[string]bool{},
-							},
-						},
-					},
-					"legacyl2pool1": {
-						Name: "legacyl2pool1",
-						CIDR: []*net.IPNet{ipnet("10.21.0.0/16"), ipnet("10.51.0.0/24")},
-						L2Advertisements: []*L2Advertisement{{
-							Nodes:         map[string]bool{},
-							AllInterfaces: true,
-						}},
-					},
-				}},
-				BFDProfiles: map[string]*BFDProfile{},
-			},
-		},
-
-		{
-			desc: "config legacy pool with bgp communities crd",
-			crs: ClusterResources{
-				LegacyAddressPools: []v1beta1.AddressPool{
-					{
-						ObjectMeta: metav1.ObjectMeta{
-							Name: "legacybgppool1",
-						},
-						Spec: v1beta1.AddressPoolSpec{
-							Addresses: []string{
-								"10.40.0.0/16",
-								"10.60.0.0/24",
-							},
-							Protocol:   string(BGP),
-							AutoAssign: pointer.BoolPtr(false),
-							BGPAdvertisements: []v1beta1.LegacyBgpAdvertisement{
-								{
-									AggregationLength: pointer.Int32Ptr(32),
-									LocalPref:         uint32(100),
-									Communities:       []string{"bar"},
-								},
-							},
-						},
-					},
-				},
-				Communities: []v1beta1.Community{
-					{
-						ObjectMeta: metav1.ObjectMeta{
-							Name: "community",
-						},
-						Spec: v1beta1.CommunitySpec{
-							Communities: []v1beta1.CommunityAlias{
-								{
-									Name:  "bar",
-									Value: "64512:1234",
-								},
-							},
-						},
-					},
-				},
-			},
-			want: &Config{
-				Pools: &Pools{ByName: map[string]*Pool{
-					"legacybgppool1": {
-						Name: "legacybgppool1",
-						CIDR: []*net.IPNet{ipnet("10.40.0.0/16"), ipnet("10.60.0.0/24")},
-						BGPAdvertisements: []*BGPAdvertisement{
-							{
-								AggregationLength:   32,
-								AggregationLengthV6: 128,
-								LocalPref:           100,
-								Communities: func() map[community.BGPCommunity]bool {
-									c, _ := community.New("64512:1234")
-									return map[community.BGPCommunity]bool{
-										c: true,
-									}
-								}(),
-								Nodes: map[string]bool{},
-							},
-						},
-					},
-				}},
-				BFDProfiles: map[string]*BFDProfile{},
-				Peers:       map[string]*Peer{},
-			},
-		},
-		{
 			desc: "config IPAddressPool with large communities CR",
 			crs: ClusterResources{
 				Peers: []v1beta2.BGPPeer{
@@ -2547,7 +2551,7 @@ func TestParse(t *testing.T) {
 							ASN:          142,
 							Address:      "1.2.3.4",
 							Port:         1179,
-							HoldTime:     metav1.Duration{Duration: 180 * time.Second},
+							HoldTime:     ptr.To(metav1.Duration{Duration: 180 * time.Second}),
 							RouterID:     "10.20.30.40",
 							SrcAddress:   "10.20.30.40",
 							EBGPMultiHop: true,
@@ -2566,7 +2570,7 @@ func TestParse(t *testing.T) {
 								"10.50.0.0/24",
 							},
 							AvoidBuggyIPs: true,
-							AutoAssign:    pointer.BoolPtr(false),
+							AutoAssign:    ptr.To(false),
 						},
 					},
 				},
@@ -2576,7 +2580,7 @@ func TestParse(t *testing.T) {
 							Name: "adv1",
 						},
 						Spec: v1beta1.BGPAdvertisementSpec{
-							AggregationLength: pointer.Int32Ptr(32),
+							AggregationLength: ptr.To[int32](32),
 							LocalPref:         uint32(100),
 							Communities:       []string{"bar"},
 							IPAddressPools:    []string{"pool1"},
@@ -2588,8 +2592,8 @@ func TestParse(t *testing.T) {
 							Name: "adv2",
 						},
 						Spec: v1beta1.BGPAdvertisementSpec{
-							AggregationLength:   pointer.Int32Ptr(24),
-							AggregationLengthV6: pointer.Int32Ptr(64),
+							AggregationLength:   ptr.To[int32](24),
+							AggregationLengthV6: ptr.To[int32](64),
 							IPAddressPools:      []string{"pool1"},
 						},
 					},
@@ -2627,8 +2631,8 @@ func TestParse(t *testing.T) {
 						Addr:          net.ParseIP("1.2.3.4"),
 						SrcAddr:       net.ParseIP("10.20.30.40"),
 						Port:          1179,
-						HoldTime:      180 * time.Second,
-						KeepaliveTime: 60 * time.Second,
+						HoldTime:      ptr.To(180 * time.Second),
+						KeepaliveTime: ptr.To(60 * time.Second),
 						RouterID:      net.ParseIP("10.20.30.40"),
 						NodeSelectors: []labels.Selector{labels.Everything()},
 						EBGPMultiHop:  true,
@@ -2667,119 +2671,6 @@ func TestParse(t *testing.T) {
 					},
 				}},
 				BFDProfiles: map[string]*BFDProfile{},
-			},
-		},
-		{
-			desc: "config legacy pool with BGP Communities CR and large communities",
-			crs: ClusterResources{
-				LegacyAddressPools: []v1beta1.AddressPool{
-					{
-						ObjectMeta: metav1.ObjectMeta{
-							Name: "legacybgppool1",
-						},
-						Spec: v1beta1.AddressPoolSpec{
-							Addresses: []string{
-								"10.40.0.0/16",
-								"10.60.0.0/24",
-							},
-							Protocol:   string(BGP),
-							AutoAssign: pointer.BoolPtr(false),
-							BGPAdvertisements: []v1beta1.LegacyBgpAdvertisement{
-								{
-									AggregationLength: pointer.Int32Ptr(32),
-									LocalPref:         uint32(100),
-									Communities:       []string{"bar"},
-								},
-							},
-						},
-					},
-				},
-				Communities: []v1beta1.Community{
-					{
-						ObjectMeta: metav1.ObjectMeta{
-							Name: "community",
-						},
-						Spec: v1beta1.CommunitySpec{
-							Communities: []v1beta1.CommunityAlias{
-								{
-									Name:  "bar",
-									Value: "large:123:64512:1234",
-								},
-							},
-						},
-					},
-				},
-			},
-			want: &Config{
-				Pools: &Pools{ByName: map[string]*Pool{
-					"legacybgppool1": {
-						Name: "legacybgppool1",
-						CIDR: []*net.IPNet{ipnet("10.40.0.0/16"), ipnet("10.60.0.0/24")},
-						BGPAdvertisements: []*BGPAdvertisement{
-							{
-								AggregationLength:   32,
-								AggregationLengthV6: 128,
-								LocalPref:           100,
-								Communities: func() map[community.BGPCommunity]bool {
-									c, _ := community.New("large:123:64512:1234")
-									return map[community.BGPCommunity]bool{
-										c: true,
-									}
-								}(),
-								Nodes: map[string]bool{},
-							},
-						},
-					},
-				}},
-				BFDProfiles: map[string]*BFDProfile{},
-				Peers:       map[string]*Peer{},
-			},
-		},
-		{
-			desc: "config mixing legacy pools with IP pools with overlapping ips",
-			crs: ClusterResources{
-				Pools: []v1beta1.IPAddressPool{
-					{
-						ObjectMeta: metav1.ObjectMeta{
-							Name: "pool1",
-						},
-						Spec: v1beta1.IPAddressPoolSpec{
-							Addresses: []string{
-								"10.20.0.0/16",
-								"10.50.0.0/24",
-							},
-							AvoidBuggyIPs: true,
-							AutoAssign:    pointer.BoolPtr(false),
-						},
-					},
-				},
-				LegacyAddressPools: []v1beta1.AddressPool{
-					{
-						ObjectMeta: metav1.ObjectMeta{
-							Name: "legacyl2pool1",
-						},
-						Spec: v1beta1.AddressPoolSpec{
-							Addresses: []string{
-								"10.20.0.0/16",
-								"10.51.0.0/24",
-							},
-							Protocol:   string(Layer2),
-							AutoAssign: pointer.BoolPtr(false),
-						},
-					},
-					{
-						ObjectMeta: metav1.ObjectMeta{
-							Name: "legacybgppool1",
-						},
-						Spec: v1beta1.AddressPoolSpec{
-							Addresses: []string{
-								"10.40.0.0/16",
-								"10.60.0.0/24",
-							},
-							Protocol: string(BGP),
-						},
-					},
-				},
 			},
 		},
 		{
@@ -2831,7 +2722,7 @@ func TestParse(t *testing.T) {
 							Name: "adv1",
 						},
 						Spec: v1beta1.BGPAdvertisementSpec{
-							AggregationLength: pointer.Int32Ptr(32),
+							AggregationLength: ptr.To[int32](32),
 							LocalPref:         uint32(100),
 							IPAddressPoolSelectors: []metav1.LabelSelector{
 								{
@@ -2847,7 +2738,7 @@ func TestParse(t *testing.T) {
 							Name: "adv2",
 						},
 						Spec: v1beta1.BGPAdvertisementSpec{
-							AggregationLength: pointer.Int32Ptr(32),
+							AggregationLength: ptr.To[int32](32),
 							LocalPref:         uint32(200),
 							IPAddressPoolSelectors: []metav1.LabelSelector{
 								{
@@ -2975,7 +2866,7 @@ func TestParse(t *testing.T) {
 							Name: "adv1",
 						},
 						Spec: v1beta1.BGPAdvertisementSpec{
-							AggregationLength: pointer.Int32Ptr(32),
+							AggregationLength: ptr.To[int32](32),
 							LocalPref:         uint32(100),
 							IPAddressPoolSelectors: []metav1.LabelSelector{
 								{
@@ -3016,7 +2907,7 @@ func TestParse(t *testing.T) {
 							Name: "adv1",
 						},
 						Spec: v1beta1.BGPAdvertisementSpec{
-							AggregationLength: pointer.Int32Ptr(32),
+							AggregationLength: ptr.To[int32](32),
 							LocalPref:         uint32(100),
 							IPAddressPoolSelectors: []metav1.LabelSelector{
 								{
@@ -3122,7 +3013,7 @@ func TestParse(t *testing.T) {
 							Name: "adv1",
 						},
 						Spec: v1beta1.BGPAdvertisementSpec{
-							AggregationLength: pointer.Int32Ptr(32),
+							AggregationLength: ptr.To[int32](32),
 							LocalPref:         uint32(100),
 							IPAddressPoolSelectors: []metav1.LabelSelector{
 								{
@@ -3138,7 +3029,7 @@ func TestParse(t *testing.T) {
 							Name: "adv2",
 						},
 						Spec: v1beta1.BGPAdvertisementSpec{
-							AggregationLength: pointer.Int32Ptr(32),
+							AggregationLength: ptr.To[int32](32),
 							LocalPref:         uint32(200),
 							IPAddressPoolSelectors: []metav1.LabelSelector{
 								{
@@ -3246,34 +3137,6 @@ func TestParse(t *testing.T) {
 						},
 					},
 				},
-				LegacyAddressPools: []v1beta1.AddressPool{
-					{
-						ObjectMeta: metav1.ObjectMeta{
-							Name: "legacyl2pool1",
-						},
-						Spec: v1beta1.AddressPoolSpec{
-							Addresses: []string{
-								"10.21.0.0/16",
-								"10.51.0.0/24",
-							},
-							Protocol:   string(Layer2),
-							AutoAssign: pointer.BoolPtr(false),
-						},
-					},
-					{
-						ObjectMeta: metav1.ObjectMeta{
-							Name: "legacybgppool1",
-						},
-						Spec: v1beta1.AddressPoolSpec{
-							Addresses: []string{
-								"10.40.0.0/16",
-								"10.60.0.0/24",
-							},
-							Protocol:   string(BGP),
-							AutoAssign: pointer.BoolPtr(false),
-						},
-					},
-				},
 				Nodes: []corev1.Node{
 					{
 						ObjectMeta: metav1.ObjectMeta{
@@ -3294,34 +3157,6 @@ func TestParse(t *testing.T) {
 			},
 			want: &Config{
 				Pools: &Pools{ByName: map[string]*Pool{
-					"legacybgppool1": {
-						Name: "legacybgppool1",
-						CIDR: []*net.IPNet{ipnet("10.40.0.0/16"), ipnet("10.60.0.0/24")},
-						BGPAdvertisements: []*BGPAdvertisement{
-							{
-								AggregationLength:   32,
-								AggregationLengthV6: 128,
-								Communities:         map[community.BGPCommunity]bool{},
-								Nodes: map[string]bool{
-									"first":  true,
-									"second": true,
-								},
-							},
-						},
-					},
-
-					"legacyl2pool1": {
-						Name: "legacyl2pool1",
-						CIDR: []*net.IPNet{ipnet("10.21.0.0/16"), ipnet("10.51.0.0/24")},
-						L2Advertisements: []*L2Advertisement{{
-							Nodes: map[string]bool{
-								"first":  true,
-								"second": true,
-							},
-							AllInterfaces: true,
-						}},
-					},
-
 					"pool1": {
 						Name:       "pool1",
 						CIDR:       []*net.IPNet{ipnet("10.20.0.0/16")},
@@ -3632,7 +3467,7 @@ func TestParse(t *testing.T) {
 							Name: "adv1",
 						},
 						Spec: v1beta1.BGPAdvertisementSpec{
-							AggregationLength: pointer.Int32Ptr(32),
+							AggregationLength: ptr.To[int32](32),
 							LocalPref:         uint32(100),
 							IPAddressPools:    []string{"pool1"},
 							Peers:             []string{"peer1"},
@@ -3647,8 +3482,6 @@ func TestParse(t *testing.T) {
 						MyASN:         42,
 						ASN:           42,
 						Addr:          net.ParseIP("1.2.3.4"),
-						HoldTime:      90 * time.Second,
-						KeepaliveTime: 30 * time.Second,
 						NodeSelectors: []labels.Selector{labels.Everything()},
 						EBGPMultiHop:  false,
 					},
@@ -3675,30 +3508,162 @@ func TestParse(t *testing.T) {
 			},
 		},
 		{
-			desc: "config legacy pool with invalid community",
+			desc: "peer with dynamic asn",
 			crs: ClusterResources{
-				LegacyAddressPools: []v1beta1.AddressPool{
+
+				Peers: []v1beta2.BGPPeer{
 					{
 						ObjectMeta: metav1.ObjectMeta{
-							Name: "legacybgppool1",
+							Name: "peer1",
 						},
-						Spec: v1beta1.AddressPoolSpec{
-							Addresses: []string{
-								"10.40.0.0/16",
-								"10.60.0.0/24",
-							},
-							Protocol:   string(BGP),
-							AutoAssign: pointer.BoolPtr(false),
-							BGPAdvertisements: []v1beta1.LegacyBgpAdvertisement{
-								{
-									AggregationLength: pointer.Int32Ptr(32),
-									LocalPref:         uint32(100),
-									Communities:       []string{"1234"},
-								},
-							},
+						Spec: v1beta2.BGPPeerSpec{
+							MyASN:      42,
+							DynamicASN: v1beta2.InternalASNMode,
+							Address:    "1.2.3.4",
 						},
 					},
 				},
+			},
+			want: &Config{
+				Peers: map[string]*Peer{
+					"peer1": {
+						Name:          "peer1",
+						MyASN:         42,
+						DynamicASN:    "internal",
+						Addr:          net.ParseIP("1.2.3.4"),
+						NodeSelectors: []labels.Selector{labels.Everything()},
+						EBGPMultiHop:  false,
+					},
+				},
+				Pools:       &Pools{ByName: map[string]*Pool{}},
+				BFDProfiles: map[string]*BFDProfile{},
+			},
+		},
+		{
+			desc: "peer without asn or dynamic asn",
+			crs: ClusterResources{
+				Peers: []v1beta2.BGPPeer{
+					{
+						Spec: v1beta2.BGPPeerSpec{
+							MyASN:      42,
+							ASN:        0,
+							DynamicASN: "",
+						},
+					},
+				},
+			},
+		},
+		{
+			desc: "peer with both asn and dynamic asn",
+			crs: ClusterResources{
+				Peers: []v1beta2.BGPPeer{
+					{
+						Spec: v1beta2.BGPPeerSpec{
+							MyASN:      42,
+							ASN:        42,
+							DynamicASN: v1beta2.InternalASNMode,
+						},
+					},
+				},
+			},
+		},
+		{
+			desc: "unnumbered peer without address with interface ok",
+			crs: ClusterResources{
+
+				Peers: []v1beta2.BGPPeer{
+					{
+						ObjectMeta: metav1.ObjectMeta{
+							Name: "peer1",
+						},
+						Spec: v1beta2.BGPPeerSpec{
+							MyASN:      42,
+							DynamicASN: v1beta2.InternalASNMode,
+							Interface:  "net0",
+						},
+					},
+				},
+			},
+			want: &Config{
+				Peers: map[string]*Peer{
+					"peer1": {
+						Name:          "peer1",
+						Iface:         "net0",
+						MyASN:         42,
+						DynamicASN:    "internal",
+						NodeSelectors: []labels.Selector{labels.Everything()},
+						EBGPMultiHop:  false,
+					},
+				},
+				Pools:       &Pools{ByName: map[string]*Pool{}},
+				BFDProfiles: map[string]*BFDProfile{},
+			},
+		},
+		{
+			desc: "unnumbered peer without address without interface nok",
+			crs: ClusterResources{
+				Peers: []v1beta2.BGPPeer{
+					{
+						ObjectMeta: metav1.ObjectMeta{
+							Name: "invalid",
+						},
+						Spec: v1beta2.BGPPeerSpec{
+							MyASN:      42,
+							DynamicASN: "internal",
+						},
+					},
+				},
+			},
+		},
+		{
+			desc: "unnumbered peer with address with interface nok",
+			crs: ClusterResources{
+				Peers: []v1beta2.BGPPeer{
+					{
+						ObjectMeta: metav1.ObjectMeta{
+							Name: "invalid",
+						},
+						Spec: v1beta2.BGPPeerSpec{
+							Address:    "1.2.3.4",
+							Interface:  "net0",
+							MyASN:      42,
+							DynamicASN: "internal",
+						},
+					},
+				},
+			},
+		},
+		{
+			desc: "peer with DisableMP field",
+			crs: ClusterResources{
+				Peers: []v1beta2.BGPPeer{
+					{
+						ObjectMeta: metav1.ObjectMeta{
+							Name: "peer1",
+						},
+						Spec: v1beta2.BGPPeerSpec{
+							MyASN:     42,
+							ASN:       142,
+							Address:   "1.2.3.4",
+							DisableMP: true,
+						},
+					},
+				},
+			},
+			want: &Config{
+				Peers: map[string]*Peer{
+					"peer1": {
+						Name:                   "peer1",
+						MyASN:                  42,
+						ASN:                    142,
+						Addr:                   net.ParseIP("1.2.3.4"),
+						NodeSelectors:          []labels.Selector{labels.Everything()},
+						DisableMP:              true,
+						DualStackAddressFamily: false,
+					},
+				},
+				Pools:       &Pools{ByName: map[string]*Pool{}},
+				BFDProfiles: map[string]*BFDProfile{},
 			},
 		},
 	}
@@ -3853,4 +3818,10 @@ func TestContainsAdvertisement(t *testing.T) {
 			t.Errorf("%s: expect is %v, but result is %v", test.desc, test.expect, result)
 		}
 	}
+}
+
+func FuzzParseCIDR(f *testing.F) {
+	f.Fuzz(func(t *testing.T, input string) {
+		_, _ = ParseCIDR(input)
+	})
 }

@@ -13,10 +13,13 @@ import (
 	"text/template"
 	"time"
 
+	"errors"
+
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
-	"github.com/pkg/errors"
+	"go.universe.tf/metallb/internal/bgp/community"
 	"go.universe.tf/metallb/internal/ipfamily"
+	"k8s.io/apimachinery/pkg/util/sets"
 )
 
 var (
@@ -63,64 +66,120 @@ type BFDProfile struct {
 }
 
 type neighborConfig struct {
-	IPFamily            ipfamily.Family
-	Name                string
-	ASN                 uint32
-	Addr                string
-	SrcAddr             string
-	Port                uint16
-	HoldTime            uint64
-	KeepaliveTime       uint64
-	Password            string
-	Advertisements      []*advertisementConfig
-	BFDProfile          string
-	EBGPMultiHop        bool
-	VRFName             string
-	HasV4Advertisements bool
-	HasV6Advertisements bool
+	IPFamily                 ipfamily.Family
+	Name                     string
+	ASN                      string
+	Addr                     string
+	Iface                    string
+	SrcAddr                  string
+	Port                     uint16
+	HoldTime                 *int64
+	KeepaliveTime            *int64
+	ConnectTime              int64
+	Password                 string
+	BFDProfile               string
+	GracefulRestart          bool
+	EBGPMultiHop             bool
+	VRFName                  string
+	PrefixesV4               []string
+	PrefixesV6               []string
+	prefixesV4Set            sets.Set[string]
+	prefixesV6Set            sets.Set[string]
+	CommunityPrefixModifiers map[string]CommunityPrefixList
+	LocalPrefPrefixModifiers map[string]LocalPrefPrefixList
 }
 
 func (n *neighborConfig) ID() string {
-	if n.VRFName == "" {
-		return n.Addr
+	id := n.Addr
+	if n.Iface != "" {
+		id = n.Iface
 	}
-	return fmt.Sprintf("%s-%s", n.Addr, n.VRFName)
+	vrf := ""
+	if n.VRFName != "" {
+		vrf = "-" + n.VRFName
+	}
+	return id + vrf
 }
 
-type advertisementConfig struct {
-	IPFamily         ipfamily.Family
-	Prefix           string
-	Communities      []string
-	LargeCommunities []string
-	LocalPref        uint32
+func (n *neighborConfig) CommunityPrefixLists() []CommunityPrefixList {
+	return sortMap(n.CommunityPrefixModifiers)
 }
 
-// routerName() defines the format of the key of the "Routers" map in the
+func (n *neighborConfig) LocalPrefPrefixLists() []LocalPrefPrefixList {
+	return sortMap(n.LocalPrefPrefixModifiers)
+}
+
+func (n *neighborConfig) ToAdvertisePrefixListV4() string {
+	return fmt.Sprintf("%s-allowed-%s", n.ID(), "ipv4")
+}
+
+func (n *neighborConfig) ToAdvertisePrefixListV6() string {
+	return fmt.Sprintf("%s-allowed-%s", n.ID(), "ipv6")
+}
+
+type PropertyPrefixList struct {
+	Name        string
+	IPFamily    string
+	prefixesSet sets.Set[string]
+	Prefixes    []string
+}
+
+type CommunityPrefixList struct {
+	PropertyPrefixList
+	Community community.BGPCommunity
+}
+
+func (c CommunityPrefixList) SetStatement() string {
+	if community.IsLarge(c.Community) {
+		return fmt.Sprintf("set large-community %s additive", c.Community.String())
+	}
+	return fmt.Sprintf("set community %s additive", c.Community.String())
+}
+
+type LocalPrefPrefixList struct {
+	PropertyPrefixList
+	LocalPreference uint32
+}
+
+func (l LocalPrefPrefixList) SetStatement() string {
+	return fmt.Sprintf("set local-preference %d", l.LocalPreference)
+}
+
+// RouterName() defines the format of the key of the "Routers" map in the
 // frrConfig struct.
-func routerName(srcAddr string, myASN uint32, vrfName string) string {
+func RouterName(srcAddr string, myASN uint32, vrfName string) string {
 	return fmt.Sprintf("%d@%s@%s", myASN, srcAddr, vrfName)
 }
 
 // neighborName() defines the format of key of the 'Neighbors' map in the
 // routerConfig struct.
-func neighborName(peerAddr string, ASN uint32, vrfName string) string {
-	return fmt.Sprintf("%d@%s@%s", ASN, peerAddr, vrfName)
+func NeighborName(peerAddr, iface string, ASN uint32, dynamicASN string, vrfName string) string {
+	asn := asnFor(ASN, dynamicASN)
+	if peerAddr == "" {
+		return fmt.Sprintf("%s@%s@%s", asn, iface, vrfName)
+	}
+	return fmt.Sprintf("%s@%s@%s", asn, peerAddr, vrfName)
+}
+
+func asnFor(ASN uint32, dynamicASN string) string {
+	asn := strconv.FormatUint(uint64(ASN), 10)
+	if dynamicASN != "" {
+		asn = dynamicASN
+	}
+	return asn
 }
 
 // templateConfig uses the template library to template
 // 'globalConfigTemplate' using 'data'.
 func templateConfig(data interface{}) (string, error) {
-	i := 0
-	currentCounterName := ""
+	counterMap := map[string]int{}
 	t, err := template.New("frr.tmpl").Funcs(
 		template.FuncMap{
 			"counter": func(counterName string) int {
-				if currentCounterName != counterName {
-					currentCounterName = counterName
-					i = 0
-				}
-				i++
-				return i
+				counter := counterMap[counterName]
+				counter++
+				counterMap[counterName] = counter
+				return counter
 			},
 			"frrIPFamily": func(ipFamily ipfamily.Family) string {
 				if ipFamily == "ipv6" {
@@ -128,23 +187,43 @@ func templateConfig(data interface{}) (string, error) {
 				}
 				return "ip"
 			},
-			"localPrefPrefixList": func(neighbor *neighborConfig, localPreference uint32) string {
-				return fmt.Sprintf("%s-%d-%s-localpref-prefixes", neighbor.ID(), localPreference, neighbor.IPFamily)
+			"activateNeighborFor": func(ipFamily string, neighbourFamily ipfamily.Family) bool {
+				return neighbourFamily.String() == ipFamily || neighbourFamily == ipfamily.DualStack
 			},
-			"communityPrefixList": func(neighbor *neighborConfig, community string) string {
-				return fmt.Sprintf("%s-%s-%s-community-prefixes", neighbor.ID(), community, neighbor.IPFamily)
+			"allowedPrefixList": func(neighbor *neighborConfig, ipFamily string) string {
+				return fmt.Sprintf("%s-pl-%s", neighbor.ID(), ipFamily)
 			},
-			"largeCommunityPrefixList": func(neighbor *neighborConfig, community string) string {
-				return fmt.Sprintf("%s-large:%s-%s-community-prefixes", neighbor.ID(), community, neighbor.IPFamily)
-			},
-			"allowedPrefixList": func(neighbor *neighborConfig) string {
-				return fmt.Sprintf("%s-pl-%s", neighbor.ID(), neighbor.IPFamily)
-			},
-			"mustDisableConnectedCheck": func(ipFamily ipfamily.Family, myASN, asn uint32, eBGPMultiHop bool) bool {
-				// return true only for IPv6 eBGP sessions
-				if ipFamily == "ipv6" && myASN != asn && !eBGPMultiHop {
+			"mustDisableConnectedCheck": func(ipFamily ipfamily.Family, myASN uint32, asn, iface string, eBGPMultiHop bool) bool {
+				// return true only for non-multihop IPv6 eBGP sessions
+
+				if ipFamily != ipfamily.IPv6 {
+					return false
+				}
+
+				if eBGPMultiHop {
+					return false
+				}
+
+				if iface != "" {
 					return true
 				}
+
+				// internal means we expect the session to be iBGP
+				if asn == "internal" {
+					return false
+				}
+
+				// external means we expect the session to be eBGP
+				if asn == "external" {
+					return true
+				}
+
+				// the peer's asn is not dynamic (it is a number),
+				// we check if it is different than ours for eBGP
+				if strconv.FormatUint(uint64(myASN), 10) != asn {
+					return true
+				}
+
 				return false
 			},
 			"dict": func(values ...interface{}) (map[string]interface{}, error) {
@@ -171,7 +250,7 @@ func templateConfig(data interface{}) (string, error) {
 	return b.String(), err
 }
 
-// writeConfigFile writes the FRR configuration file (represented as a string)
+// writeConfig writes the FRR configuration file (represented as a string)
 // to 'filename'.
 func writeConfig(config string, filename string) error {
 	return os.WriteFile(filename, []byte(config), 0600)

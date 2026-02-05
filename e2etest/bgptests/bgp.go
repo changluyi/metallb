@@ -20,36 +20,43 @@ package bgptests
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"net"
 	"strings"
 	"time"
 
-	"go.universe.tf/e2etest/l2tests"
-	"go.universe.tf/e2etest/pkg/config"
-	"go.universe.tf/e2etest/pkg/executor"
-	"go.universe.tf/e2etest/pkg/k8s"
-	"go.universe.tf/e2etest/pkg/mac"
-	"go.universe.tf/e2etest/pkg/metallb"
-	"go.universe.tf/e2etest/pkg/pointer"
-	metallbv1beta1 "go.universe.tf/metallb/api/v1beta1"
-	metallbv1beta2 "go.universe.tf/metallb/api/v1beta2"
+	"github.com/google/go-cmp/cmp"
 
+	frrk8sv1beta1 "github.com/metallb/frr-k8s/api/v1beta1"
 	"github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	"github.com/openshift-kni/k8sreporter"
+	"go.universe.tf/e2etest/l2tests"
+	"go.universe.tf/e2etest/pkg/config"
+	"go.universe.tf/e2etest/pkg/executor"
+	jigservice "go.universe.tf/e2etest/pkg/jigservice"
+	"go.universe.tf/e2etest/pkg/k8s"
+	"go.universe.tf/e2etest/pkg/k8sclient"
+	"go.universe.tf/e2etest/pkg/mac"
+	"go.universe.tf/e2etest/pkg/metallb"
+	"go.universe.tf/e2etest/pkg/status"
+	metallbv1beta1 "go.universe.tf/metallb/api/v1beta1"
+	metallbv1beta2 "go.universe.tf/metallb/api/v1beta2"
 
 	"go.universe.tf/e2etest/pkg/frr"
 	frrconfig "go.universe.tf/e2etest/pkg/frr/config"
 	frrcontainer "go.universe.tf/e2etest/pkg/frr/container"
+	frrprovider "go.universe.tf/e2etest/pkg/frr/provider"
 	"go.universe.tf/e2etest/pkg/ipfamily"
 	testservice "go.universe.tf/e2etest/pkg/service"
 	corev1 "k8s.io/api/core/v1"
+	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/sets"
 	clientset "k8s.io/client-go/kubernetes"
-	"k8s.io/kubernetes/test/e2e/framework"
-	e2eservice "k8s.io/kubernetes/test/e2e/framework/service"
-	admissionapi "k8s.io/pod-security-admission/api"
+	"k8s.io/utils/ptr"
 )
 
 const (
@@ -58,10 +65,14 @@ const (
 	CommunityNoAdv        = "65535:65282" // 0xFFFFFF02: NO_ADVERTISE
 	CommunityGracefulShut = "65535:0"     // GRACEFUL_SHUTDOWN
 	SpeakerContainerName  = "speaker"
+
+	GracefulRestartEnabled  = true
+	GracefulRestartDisabled = false
 )
 
 var (
 	ConfigUpdater       config.Updater
+	FRRProvider         frrprovider.Provider
 	Reporter            *k8sreporter.KubernetesReporter
 	ReportPath          string
 	PrometheusNamespace string
@@ -69,7 +80,6 @@ var (
 
 var _ = ginkgo.Describe("BGP", func() {
 	var cs clientset.Interface
-	var f *framework.Framework
 	emptyBGPAdvertisement := metallbv1beta1.BGPAdvertisement{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: "empty",
@@ -86,44 +96,44 @@ var _ = ginkgo.Describe("BGP", func() {
 			},
 		},
 	}
+	testNamespace := ""
 
 	ginkgo.AfterEach(func() {
 		if ginkgo.CurrentSpecReport().Failed() {
-			dumpBGPInfo(ReportPath, ginkgo.CurrentSpecReport().LeafNodeText, cs, f)
+			dumpBGPInfo(ReportPath, ginkgo.CurrentSpecReport().LeafNodeText, cs, testNamespace)
 			k8s.DumpInfo(Reporter, ginkgo.CurrentSpecReport().LeafNodeText)
 		}
+		err := k8s.DeleteNamespace(cs, testNamespace)
+		Expect(err).NotTo(HaveOccurred())
 	})
 
 	ginkgo.BeforeEach(func() {
 		ginkgo.By("Clearing any previous configuration")
 
 		err := ConfigUpdater.Clean()
-		framework.ExpectNoError(err)
+		Expect(err).NotTo(HaveOccurred())
 
 		for _, c := range FRRContainers {
 			err := c.UpdateBGPConfigFile(frrconfig.Empty)
-			framework.ExpectNoError(err)
+			Expect(err).NotTo(HaveOccurred())
 		}
-	})
 
-	f = framework.NewDefaultFramework("bgp")
-	f.NamespacePodSecurityEnforceLevel = admissionapi.LevelPrivileged
-
-	ginkgo.BeforeEach(func() {
-		cs = f.ClientSet
+		cs = k8sclient.New()
+		testNamespace, err = k8s.CreateTestNamespace(cs, "bgp")
+		Expect(err).NotTo(HaveOccurred())
 	})
 
 	ginkgo.DescribeTable("A service of protocol load balancer should work with ETP=cluster", func(pairingIPFamily ipfamily.Family, poolAddresses []string, tweak testservice.Tweak) {
 
-		_, svc := setupBGPService(f, pairingIPFamily, poolAddresses, FRRContainers, func(svc *corev1.Service) {
+		_, svc := setupBGPService(cs, testNamespace, pairingIPFamily, poolAddresses, FRRContainers, func(svc *corev1.Service) {
 			testservice.TrafficPolicyCluster(svc)
 			tweak(svc)
 		})
 		defer testservice.Delete(cs, svc)
 
 		allNodes, err := cs.CoreV1().Nodes().List(context.Background(), metav1.ListOptions{})
-		framework.ExpectNoError(err)
-		validateDesiredLB(svc)
+		Expect(err).NotTo(HaveOccurred())
+		testservice.ValidateDesiredLB(svc)
 
 		for _, c := range FRRContainers {
 			validateService(svc, allNodes.Items, c)
@@ -146,27 +156,138 @@ var _ = ginkgo.Describe("BGP", func() {
 			}),
 	)
 
+	ginkgo.Describe("GracefulRestart, when speakers restart", func() {
+
+		ginkgo.AfterEach(func() {
+			for _, c := range FRRContainers {
+				c.NeighborConfig.GracefulRestart = false
+			}
+		})
+
+		assertDuringSpeakerRestart := func(gracefulRestart bool, pairingIPFamily ipfamily.Family, poolAddresses []string, tweak testservice.Tweak) {
+			_, svc := setupBGPService(cs, testNamespace, pairingIPFamily, poolAddresses,
+				FRRContainers, func(svc *corev1.Service) {
+					testservice.TrafficPolicyCluster(svc)
+					tweak(svc)
+				})
+			defer testservice.Delete(cs, svc)
+
+			allNodes, err := cs.CoreV1().Nodes().List(context.Background(), metav1.ListOptions{})
+			Expect(err).NotTo(HaveOccurred())
+			testservice.ValidateDesiredLB(svc)
+
+			for _, c := range FRRContainers {
+				validateService(svc, allNodes.Items, c)
+			}
+			err = metallb.RestartSpeakerPods(cs)
+			Expect(err).NotTo(HaveOccurred())
+
+			if gracefulRestart == GracefulRestartDisabled {
+				Eventually(func() error {
+					for _, c := range FRRContainers {
+						err := validateServiceNoWait(svc, allNodes.Items, c)
+						if errors.Is(err, ErrStaleRoute) {
+							Expect(err).NotTo(HaveOccurred(),
+								"a stale route cannot be observed if GR disabled")
+						}
+						if err != nil {
+							return err
+						}
+					}
+					return nil
+				}, 2*time.Minute, time.Second).Should(HaveOccurred(), "a downtime should be observed")
+				return
+			}
+
+			Eventually(func() error {
+				for _, c := range FRRContainers {
+					err := validateServiceNoWait(svc, allNodes.Items, c)
+					if errors.Is(err, ErrStaleRoute) {
+						continue // when GR, is normal to observe stale routes
+					}
+					Expect(err).NotTo(HaveOccurred(), "downtime was observed")
+				}
+
+				pods, err := metallb.SpeakerPods(cs)
+				if err != nil {
+					return err
+				}
+
+				for _, p := range pods {
+					if !k8s.PodIsReady(p) {
+						return fmt.Errorf("speaker pods are not ready")
+					}
+				}
+
+				return nil
+			}, 2*time.Minute, time.Second).ShouldNot(HaveOccurred(), "no downtime until speakers are ready")
+
+			for _, c := range FRRContainers {
+				validateService(svc, allNodes.Items, c)
+			}
+		}
+
+		ginkgo.Context("and when GR enabled", func() {
+
+			assertDuringSpeakerRestartWithGR := func(pairingIPFamily ipfamily.Family, poolAddresses []string, tweak testservice.Tweak) {
+				assertDuringSpeakerRestart(GracefulRestartEnabled, pairingIPFamily, poolAddresses, tweak)
+			}
+
+			ginkgo.BeforeEach(func() {
+				for _, c := range FRRContainers {
+					c.NeighborConfig.GracefulRestart = true
+				}
+			})
+
+			ginkgo.DescribeTable("dataplane should keep working", assertDuringSpeakerRestartWithGR,
+				ginkgo.Entry("FRR-MODE IPV4", ipfamily.IPv4, []string{v4PoolAddresses}, func(_ *corev1.Service) {}),
+				ginkgo.Entry("FRR-MODE IPV6", ipfamily.IPv6, []string{v6PoolAddresses}, func(_ *corev1.Service) {}),
+				ginkgo.Entry("FRR-MODE DUALSTACK", ipfamily.DualStack, []string{v4PoolAddresses, v6PoolAddresses},
+					func(svc *corev1.Service) { testservice.DualStack(svc) }),
+			)
+		})
+
+		ginkgo.Context("when GR disabled", func() {
+			assertDuringSpeakerRestartWithoutGR := func(pairingIPFamily ipfamily.Family, poolAddresses []string, tweak testservice.Tweak) {
+				assertDuringSpeakerRestart(GracefulRestartDisabled, pairingIPFamily, poolAddresses, tweak)
+			}
+
+			ginkgo.BeforeEach(func() {
+				for _, c := range FRRContainers {
+					c.NeighborConfig.GracefulRestart = false
+				}
+			})
+
+			ginkgo.DescribeTable("dataplane should have a downtime", assertDuringSpeakerRestartWithoutGR,
+				ginkgo.Entry("FRR-MODE IPV4", ipfamily.IPv4, []string{v4PoolAddresses}, func(_ *corev1.Service) {}),
+				ginkgo.Entry("FRR-MODE IPV6", ipfamily.IPv6, []string{v6PoolAddresses}, func(_ *corev1.Service) {}),
+				ginkgo.Entry("FRR-MODE DUALSTACK", ipfamily.DualStack, []string{v4PoolAddresses, v6PoolAddresses},
+					func(svc *corev1.Service) { testservice.DualStack(svc) }),
+			)
+		})
+	})
+
 	ginkgo.Describe("Service with ETP=cluster", func() {
 		ginkgo.It("IPV4 - should not be announced from a node with a NetworkUnavailable condition", func() {
 			allNodes, err := cs.CoreV1().Nodes().List(context.Background(), metav1.ListOptions{})
-			framework.ExpectNoError(err)
+			Expect(err).NotTo(HaveOccurred())
 			nodeToSet := allNodes.Items[0].Name
 
-			_, svc := setupBGPService(f, ipfamily.IPv4, []string{v4PoolAddresses}, FRRContainers, func(svc *corev1.Service) {
+			_, svc := setupBGPService(cs, testNamespace, ipfamily.IPv4, []string{v4PoolAddresses}, FRRContainers, func(svc *corev1.Service) {
 				testservice.TrafficPolicyCluster(svc)
 			})
 			defer testservice.Delete(cs, svc)
-			validateDesiredLB(svc)
+			testservice.ValidateDesiredLB(svc)
 
 			for _, c := range FRRContainers {
 				validateService(svc, allNodes.Items, c)
 			}
 
 			err = k8s.SetNodeCondition(cs, nodeToSet, corev1.NodeNetworkUnavailable, corev1.ConditionTrue)
-			framework.ExpectNoError(err)
+			Expect(err).NotTo(HaveOccurred())
 			defer func() {
 				err = k8s.SetNodeCondition(cs, nodeToSet, corev1.NodeNetworkUnavailable, corev1.ConditionFalse)
-				framework.ExpectNoError(err)
+				Expect(err).NotTo(HaveOccurred())
 			}()
 
 			ginkgo.By("validating service is not announced from the unavailable node")
@@ -187,19 +308,19 @@ var _ = ginkgo.Describe("BGP", func() {
 
 	ginkgo.DescribeTable("A service of protocol load balancer should work with ETP=local", func(pairingIPFamily ipfamily.Family, poolAddresses []string, tweak testservice.Tweak) {
 
-		jig, svc := setupBGPService(f, pairingIPFamily, poolAddresses, FRRContainers, func(svc *corev1.Service) {
+		jig, svc := setupBGPService(cs, testNamespace, pairingIPFamily, poolAddresses, FRRContainers, func(svc *corev1.Service) {
 			testservice.TrafficPolicyLocal(svc)
 			tweak(svc)
 		})
 		defer testservice.Delete(cs, svc)
 
-		validateDesiredLB(svc)
+		testservice.ValidateDesiredLB(svc)
 
-		err := jig.Scale(2)
-		framework.ExpectNoError(err)
+		err := jig.Scale(context.TODO(), 2)
+		Expect(err).NotTo(HaveOccurred())
 
-		epNodes, err := jig.ListNodesWithEndpoint() // Only nodes with an endpoint should be advertising the IP
-		framework.ExpectNoError(err)
+		epNodes, err := jig.ListNodesWithEndpoint(context.TODO()) // Only nodes with an endpoint should be advertising the IP
+		Expect(err).NotTo(HaveOccurred())
 
 		for _, c := range FRRContainers {
 			validateService(svc, epNodes, c)
@@ -215,7 +336,7 @@ var _ = ginkgo.Describe("BGP", func() {
 
 	ginkgo.DescribeTable("FRR must be deployed when enabled", func(pairingIPFamily ipfamily.Family, poolAddresses []string) {
 
-		_, svc := setupBGPService(f, pairingIPFamily, poolAddresses, FRRContainers, func(svc *corev1.Service) {
+		_, svc := setupBGPService(cs, testNamespace, pairingIPFamily, poolAddresses, FRRContainers, func(svc *corev1.Service) {
 			testservice.TrafficPolicyCluster(svc)
 		})
 		defer testservice.Delete(cs, svc)
@@ -247,41 +368,39 @@ var _ = ginkgo.Describe("BGP", func() {
 
 		for _, c := range FRRContainers {
 			err := frrcontainer.PairWithNodes(cs, c, pairingIPFamily)
-			framework.ExpectNoError(err)
+			Expect(err).NotTo(HaveOccurred())
 		}
 
 		err := ConfigUpdater.Update(resources)
-		framework.ExpectNoError(err)
+		Expect(err).NotTo(HaveOccurred())
 
 		for _, c := range FRRContainers {
 			validateFRRPeeredWithAllNodes(cs, c, pairingIPFamily)
 		}
 
 		allNodes, err = cs.CoreV1().Nodes().List(context.Background(), metav1.ListOptions{})
-		framework.ExpectNoError(err)
+		Expect(err).NotTo(HaveOccurred())
 
 		serviceIP, err := config.GetIPFromRangeByIndex(poolAddresses[0], 1)
-		framework.ExpectNoError(err)
+		Expect(err).NotTo(HaveOccurred())
 
-		svc, _ := testservice.CreateWithBackendPort(cs, f.Namespace.Name, "first-service",
+		svc, _ := testservice.CreateWithBackendPort(cs, testNamespace, "first-service",
 			testservice.TestServicePort,
 			func(svc *corev1.Service) {
 				svc.Spec.LoadBalancerIP = serviceIP
-				svc.Annotations = map[string]string{"metallb.universe.tf/allow-shared-ip": "foo"}
-				svc.Spec.Ports[0].Port = int32(testservice.TestServicePort)
+				svc.Annotations = map[string]string{"metallb.io/allow-shared-ip": "foo"}
 			})
 		defer testservice.Delete(cs, svc)
-		svc1, _ := testservice.CreateWithBackendPort(cs, f.Namespace.Name, "second-service",
+		svc1, _ := testservice.CreateWithBackendPort(cs, testNamespace, "second-service",
 			testservice.TestServicePort+1,
 			func(svc *corev1.Service) {
 				svc.Spec.LoadBalancerIP = serviceIP
-				svc.Annotations = map[string]string{"metallb.universe.tf/allow-shared-ip": "foo"}
-				svc.Spec.Ports[0].Port = int32(testservice.TestServicePort + 1)
+				svc.Annotations = map[string]string{"metallb.io/allow-shared-ip": "foo"}
 			})
 		defer testservice.Delete(cs, svc1)
 
-		validateDesiredLB(svc)
-		validateDesiredLB(svc1)
+		testservice.ValidateDesiredLB(svc)
+		testservice.ValidateDesiredLB(svc1)
 
 		for _, c := range FRRContainers {
 			validateService(svc, allNodes.Items, c)
@@ -296,7 +415,7 @@ var _ = ginkgo.Describe("BGP", func() {
 		ginkgo.AfterEach(func() {
 			// Clean previous configuration.
 			err := ConfigUpdater.Clean()
-			framework.ExpectNoError(err)
+			Expect(err).NotTo(HaveOccurred())
 		})
 
 		ginkgo.DescribeTable("set different AddressPools ranges modes", func(addressPools []metallbv1beta1.IPAddressPool, pairingFamily ipfamily.Family, tweak testservice.Tweak) {
@@ -308,28 +427,28 @@ var _ = ginkgo.Describe("BGP", func() {
 
 			for _, c := range FRRContainers {
 				err := frrcontainer.PairWithNodes(cs, c, pairingFamily)
-				framework.ExpectNoError(err)
+				Expect(err).NotTo(HaveOccurred())
 			}
 
 			err := ConfigUpdater.Update(resources)
-			framework.ExpectNoError(err)
+			Expect(err).NotTo(HaveOccurred())
 
 			for _, c := range FRRContainers {
 				validateFRRPeeredWithAllNodes(cs, c, pairingFamily)
 			}
 
-			svc, _ := testservice.CreateWithBackend(cs, f.Namespace.Name, "external-local-lb", tweak)
+			svc, _ := testservice.CreateWithBackend(cs, testNamespace, "external-local-lb", tweak)
 			defer testservice.Delete(cs, svc)
 
 			for _, i := range svc.Status.LoadBalancer.Ingress {
 				ginkgo.By("validate LoadBalancer IP is in the AddressPool range")
-				ingressIP := e2eservice.GetIngressPoint(&i)
+				ingressIP := jigservice.GetIngressPoint(&i)
 				err = config.ValidateIPInRange(addressPools, ingressIP)
-				framework.ExpectNoError(err)
+				Expect(err).NotTo(HaveOccurred())
 			}
 
 			allNodes, err := cs.CoreV1().Nodes().List(context.Background(), metav1.ListOptions{})
-			framework.ExpectNoError(err)
+			Expect(err).NotTo(HaveOccurred())
 
 			for _, c := range FRRContainers {
 				validateService(svc, allNodes.Items, c)
@@ -407,19 +526,46 @@ var _ = ginkgo.Describe("BGP", func() {
 		}
 
 		err := ConfigUpdater.Update(resources)
-		framework.ExpectNoError(err)
+		Expect(err).NotTo(HaveOccurred())
 
 		for _, c := range FRRContainers {
 			err = frrcontainer.PairWithNodes(cs, c, ipFamily)
-			framework.ExpectNoError(err)
+			Expect(err).NotTo(HaveOccurred())
 		}
 
 		for _, c := range FRRContainers {
 			validateFRRPeeredWithAllNodes(cs, c, ipFamily)
 			neighbors, err := frr.NeighborsInfo(c)
-			framework.ExpectNoError(err)
+			Expect(err).NotTo(HaveOccurred())
 			for _, n := range neighbors {
-				framework.ExpectEqual(n.RemoteRouterID, "10.10.10.1")
+				Expect(n.RemoteRouterID).To(Equal("10.10.10.1"))
+			}
+		}
+	},
+		ginkgo.Entry("IPV4", ipfamily.IPv4),
+		ginkgo.Entry("IPV6", ipfamily.IPv6))
+
+	ginkgo.DescribeTable("FRR configure peers with GracefulRestart and validate external containers are paired with nodes", func(ipFamily ipfamily.Family) {
+		ginkgo.By("configure peer")
+
+		resources := config.Resources{
+			Peers: metallb.WithGracefulRestart(metallb.PeersForContainers(FRRContainers, ipFamily)),
+		}
+
+		err := ConfigUpdater.Update(resources)
+		Expect(err).NotTo(HaveOccurred())
+
+		for _, c := range FRRContainers {
+			err = frrcontainer.PairWithNodes(cs, c, ipFamily)
+			Expect(err).NotTo(HaveOccurred())
+		}
+
+		for _, c := range FRRContainers {
+			validateFRRPeeredWithAllNodes(cs, c, ipFamily)
+			neighbors, err := frr.NeighborsInfo(c)
+			Expect(err).NotTo(HaveOccurred())
+			for _, n := range neighbors {
+				Expect(n.GRInfo.RemoteGrMode).To(Equal("Restart"))
 			}
 		}
 	},
@@ -437,17 +583,17 @@ var _ = ginkgo.Describe("BGP", func() {
 			PasswordSecrets: metallb.BGPPeerSecretReferences(FRRContainers),
 		}
 		err := ConfigUpdater.Update(resources)
-		framework.ExpectNoError(err)
+		Expect(err).NotTo(HaveOccurred())
 		defer func() {
 			for _, s := range resources.PasswordSecrets {
 				err := cs.CoreV1().Secrets(metallb.Namespace).Delete(context.Background(), s.Name, metav1.DeleteOptions{})
-				framework.ExpectNoError(err)
+				Expect(err).NotTo(HaveOccurred())
 			}
 		}()
 
 		for _, c := range FRRContainers {
 			err = frrcontainer.PairWithNodes(cs, c, ipFamily)
-			framework.ExpectNoError(err)
+			Expect(err).NotTo(HaveOccurred())
 		}
 
 		for _, c := range FRRContainers {
@@ -456,6 +602,142 @@ var _ = ginkgo.Describe("BGP", func() {
 	},
 		ginkgo.Entry("IPV4 with Secret Ref set for BGPPeer CR", ipfamily.IPv4),
 		ginkgo.Entry("IPV6 with Secret Ref set for BGPPeer CR", ipfamily.IPv6))
+
+	ginkgo.DescribeTable("ServiceBGPStatus", func(ipFamily ipfamily.Family, poolAddresses []string, tweak testservice.Tweak) {
+		validateStatusesFor := func(nodes []string, peers sets.Set[string], svc *corev1.Service, expectNoResources bool) error {
+			for _, n := range nodes {
+				s, err := status.BGPForServiceAndNode(ConfigUpdater.Client(), svc, n)
+				if expectNoResources && !k8serrors.IsNotFound(err) {
+					return fmt.Errorf("expected status for node %s to not be there, got %v with err %w", n, s, err)
+				}
+				if expectNoResources && k8serrors.IsNotFound(err) {
+					continue
+				}
+				if err != nil {
+					return err
+				}
+				statusPeers := sets.New(s.Status.Peers...)
+				if !peers.Equal(statusPeers) {
+					return fmt.Errorf("expected status peers to be %v, got %v for node %s\n diff: %s", peers, s.Status.Peers, n, cmp.Diff(sets.List(peers), s.Status.Peers))
+				}
+			}
+			return nil
+		}
+
+		peers := metallb.PeersForContainers(FRRContainers, ipFamily)
+		peersNames := sets.Set[string]{}
+		for _, p := range peers {
+			peersNames.Insert(p.Name)
+		}
+
+		bgpAdv := metallbv1beta1.BGPAdvertisement{
+			ObjectMeta: metav1.ObjectMeta{Name: "empty", Namespace: ConfigUpdater.Namespace()},
+			Spec:       metallbv1beta1.BGPAdvertisementSpec{},
+		}
+
+		ginkgo.By("Creating the service advertised to all peers")
+		resources := config.Resources{
+			Pools: []metallbv1beta1.IPAddressPool{
+				{
+					ObjectMeta: metav1.ObjectMeta{
+						Name: "bgp-test",
+					},
+					Spec: metallbv1beta1.IPAddressPoolSpec{
+						Addresses: poolAddresses,
+					},
+				},
+			},
+			Peers:   peers,
+			BGPAdvs: []metallbv1beta1.BGPAdvertisement{bgpAdv},
+		}
+
+		err := ConfigUpdater.Update(resources)
+		Expect(err).NotTo(HaveOccurred())
+
+		svc, _ := testservice.CreateWithBackend(cs, testNamespace, "external-local-lb", func(svc *corev1.Service) {
+			testservice.TrafficPolicyCluster(svc)
+			tweak(svc)
+		})
+		svcDeleted := false
+		defer func() {
+			if !svcDeleted {
+				testservice.Delete(cs, svc)
+			}
+		}()
+
+		for _, i := range svc.Status.LoadBalancer.Ingress {
+			ginkgo.By("validate LoadBalancer IP is in the AddressPool range")
+			ingressIP := jigservice.GetIngressPoint(&i)
+			err = config.ValidateIPInRange(resources.Pools, ingressIP)
+			Expect(err).NotTo(HaveOccurred())
+		}
+
+		nodes, err := cs.CoreV1().Nodes().List(context.Background(), metav1.ListOptions{})
+		Expect(err).ToNot(HaveOccurred())
+		nodesNames := []string{}
+		for _, n := range nodes.Items {
+			nodesNames = append(nodesNames, n.Name)
+		}
+
+		ginkgo.By("Verifying all nodes create a status for the service")
+		Eventually(func() error {
+			return validateStatusesFor(nodesNames, peersNames, svc, false)
+		}, 2*time.Minute, 2*time.Second).ShouldNot(HaveOccurred())
+
+		ginkgo.By("Adding a dummy peer to the adv")
+		err = ConfigUpdater.Client().Get(context.TODO(), types.NamespacedName{Namespace: bgpAdv.Namespace, Name: bgpAdv.Name}, &bgpAdv)
+		Expect(err).ToNot(HaveOccurred())
+		bgpAdv.Spec.Peers = append(sets.List(peersNames), "dummy")
+		err = ConfigUpdater.Client().Update(context.TODO(), &bgpAdv)
+		Expect(err).ToNot(HaveOccurred())
+
+		Consistently(func() error {
+			return validateStatusesFor(nodesNames, peersNames, svc, false)
+		}, 5*time.Second, 1*time.Second).ShouldNot(HaveOccurred(), "expected status peers to be the same as before after adding a dummy peer")
+
+		ginkgo.By("Removing the first peer")
+		peer0 := peers[0]
+		peer0.Namespace = ConfigUpdater.Namespace()
+		err = ConfigUpdater.Client().Delete(context.TODO(), &peer0)
+		Expect(err).ToNot(HaveOccurred())
+		peersNames.Delete(peer0.Name)
+		Eventually(func() error {
+			return validateStatusesFor(nodesNames, peersNames, svc, peersNames.Len() == 0)
+		}, 2*time.Minute, 2*time.Second).ShouldNot(HaveOccurred())
+
+		ginkgo.By("Updating the node selector of the adv to not include the first node")
+		err = ConfigUpdater.Client().Get(context.TODO(), types.NamespacedName{Namespace: bgpAdv.Namespace, Name: bgpAdv.Name}, &bgpAdv)
+		Expect(err).ToNot(HaveOccurred())
+		bgpAdv.Spec.NodeSelectors = []metav1.LabelSelector{
+			{
+				MatchExpressions: []metav1.LabelSelectorRequirement{
+					{
+						Operator: "In",
+						Key:      "kubernetes.io/hostname",
+						Values:   nodesNames[1:],
+					},
+				}},
+		}
+		err = ConfigUpdater.Client().Update(context.TODO(), &bgpAdv)
+		Expect(err).ToNot(HaveOccurred())
+
+		Eventually(func() error {
+			return validateStatusesFor([]string{nodesNames[0]}, sets.Set[string]{}, svc, true)
+		}, 2*time.Minute, 2*time.Second).ShouldNot(HaveOccurred())
+		Eventually(func() error {
+			return validateStatusesFor(nodesNames[1:], peersNames, svc, peersNames.Len() == 0)
+		}, 2*time.Minute, 2*time.Second).ShouldNot(HaveOccurred())
+
+		ginkgo.By("Validating the the statuses are deleted after deleting the service")
+		testservice.Delete(cs, svc)
+		svcDeleted = true
+		Eventually(func() error {
+			return validateStatusesFor(nodesNames, sets.Set[string]{}, svc, true)
+		}, 2*time.Minute, 2*time.Second).ShouldNot(HaveOccurred())
+	},
+		ginkgo.Entry("IPV4", ipfamily.IPv4, []string{v4PoolAddresses}, func(_ *corev1.Service) {}),
+		ginkgo.Entry("IPV6", ipfamily.IPv6, []string{v6PoolAddresses}, func(_ *corev1.Service) {}),
+		ginkgo.Entry("DUALSTACK", ipfamily.DualStack, []string{v4PoolAddresses, v6PoolAddresses}, testservice.DualStack))
 
 	ginkgo.Context("BFD", func() {
 		ginkgo.DescribeTable("should work with the given bfd profile", func(bfd metallbv1beta1.BFDProfile, pairingFamily ipfamily.Family, poolAddresses []string, tweak testservice.Tweak) {
@@ -475,20 +757,20 @@ var _ = ginkgo.Describe("BGP", func() {
 				BFDProfiles: []metallbv1beta1.BFDProfile{bfd},
 			}
 			err := ConfigUpdater.Update(resources)
-			framework.ExpectNoError(err)
+			Expect(err).NotTo(HaveOccurred())
 
 			for _, c := range FRRContainers {
 				err := frrcontainer.PairWithNodes(cs, c, pairingFamily, func(container *frrcontainer.FRR) {
 					container.NeighborConfig.BFDEnabled = true
 				})
-				framework.ExpectNoError(err)
+				Expect(err).NotTo(HaveOccurred())
 			}
 
-			svc, _ := testservice.CreateWithBackend(cs, f.Namespace.Name, "external-local-lb", tweak)
+			svc, _ := testservice.CreateWithBackend(cs, testNamespace, "external-local-lb", tweak)
 			defer testservice.Delete(cs, svc)
 
 			allNodes, err := cs.CoreV1().Nodes().List(context.Background(), metav1.ListOptions{})
-			framework.ExpectNoError(err)
+			Expect(err).NotTo(HaveOccurred())
 
 			for _, c := range FRRContainers {
 				validateFRRPeeredWithAllNodes(cs, c, pairingFamily)
@@ -520,6 +802,33 @@ var _ = ginkgo.Describe("BGP", func() {
 				return nil
 			}, 4*time.Minute, 1*time.Second).ShouldNot(HaveOccurred())
 
+			ginkgo.By("checking the sessions don't flap when changing the configuration")
+
+			previousNeighbors := map[string]frr.NeighborsMap{}
+			for _, c := range FRRContainers {
+				neighbors, err := frr.NeighborsInfo(c)
+				Expect(err).NotTo(HaveOccurred())
+				previousNeighbors[c.Name] = neighbors
+			}
+			ginkgo.By("creating another the service")
+			svc1, _ := testservice.CreateWithBackend(cs, testNamespace, "external-local-lb1", tweak)
+			defer testservice.Delete(cs, svc1)
+
+			Consistently(func() error {
+				for _, c := range FRRContainers {
+					neighbors, err := frr.NeighborsInfo(c)
+					Expect(err).NotTo(HaveOccurred())
+					Expect(neighbors).To(HaveLen(len(previousNeighbors[c.Name])))
+
+					for _, n := range neighbors {
+						previousDropped := previousNeighbors[c.Name][n.ID].ConnectionsDropped
+						if n.ConnectionsDropped > previousDropped {
+							return fmt.Errorf("increased connections dropped from %s to %s, previous: %d current %d", c.Name, n.ID, previousDropped, n.ConnectionsDropped)
+						}
+					}
+				}
+				return nil
+			}, 10*time.Second, 1*time.Second).ShouldNot(HaveOccurred())
 		},
 			ginkgo.Entry("IPV4 - default",
 				metallbv1beta1.BFDProfile{
@@ -533,12 +842,12 @@ var _ = ginkgo.Describe("BGP", func() {
 						Name: "full1",
 					},
 					Spec: metallbv1beta1.BFDProfileSpec{
-						ReceiveInterval:  pointer.Uint32Ptr(60),
-						TransmitInterval: pointer.Uint32Ptr(61),
-						EchoInterval:     pointer.Uint32Ptr(62),
-						EchoMode:         pointer.BoolPtr(false),
-						PassiveMode:      pointer.BoolPtr(false),
-						MinimumTTL:       pointer.Uint32Ptr(254),
+						ReceiveInterval:  ptr.To(uint32(60)),
+						TransmitInterval: ptr.To(uint32(61)),
+						EchoInterval:     ptr.To(uint32(62)),
+						EchoMode:         ptr.To(false),
+						PassiveMode:      ptr.To(false),
+						MinimumTTL:       ptr.To(uint32(254)),
 					},
 				}, ipfamily.IPv4, []string{v4PoolAddresses}, testservice.TrafficPolicyCluster),
 			ginkgo.Entry("IPV4 - echo mode enabled",
@@ -547,12 +856,12 @@ var _ = ginkgo.Describe("BGP", func() {
 						Name: "echo",
 					},
 					Spec: metallbv1beta1.BFDProfileSpec{
-						ReceiveInterval:  pointer.Uint32Ptr(80),
-						TransmitInterval: pointer.Uint32Ptr(81),
-						EchoInterval:     pointer.Uint32Ptr(82),
-						EchoMode:         pointer.BoolPtr(true),
-						PassiveMode:      pointer.BoolPtr(false),
-						MinimumTTL:       pointer.Uint32Ptr(254),
+						ReceiveInterval:  ptr.To(uint32(80)),
+						TransmitInterval: ptr.To(uint32(81)),
+						EchoInterval:     ptr.To(uint32(82)),
+						EchoMode:         ptr.To(true),
+						PassiveMode:      ptr.To(false),
+						MinimumTTL:       ptr.To(uint32(254)),
 					},
 				}, ipfamily.IPv4, []string{v4PoolAddresses}, testservice.TrafficPolicyCluster),
 			ginkgo.Entry("IPV6 - default",
@@ -567,12 +876,12 @@ var _ = ginkgo.Describe("BGP", func() {
 						Name: "full1",
 					},
 					Spec: metallbv1beta1.BFDProfileSpec{
-						ReceiveInterval:  pointer.Uint32Ptr(60),
-						TransmitInterval: pointer.Uint32Ptr(61),
-						EchoInterval:     pointer.Uint32Ptr(62),
-						EchoMode:         pointer.BoolPtr(false),
-						PassiveMode:      pointer.BoolPtr(false),
-						MinimumTTL:       pointer.Uint32Ptr(254),
+						ReceiveInterval:  ptr.To(uint32(60)),
+						TransmitInterval: ptr.To(uint32(61)),
+						EchoInterval:     ptr.To(uint32(62)),
+						EchoMode:         ptr.To(false),
+						PassiveMode:      ptr.To(false),
+						MinimumTTL:       ptr.To(uint32(254)),
 					},
 				}, ipfamily.IPv6, []string{v6PoolAddresses}, testservice.TrafficPolicyCluster),
 			ginkgo.Entry("DUALSTACK - full params",
@@ -581,12 +890,12 @@ var _ = ginkgo.Describe("BGP", func() {
 						Name: "full1",
 					},
 					Spec: metallbv1beta1.BFDProfileSpec{
-						ReceiveInterval:  pointer.Uint32Ptr(60),
-						TransmitInterval: pointer.Uint32Ptr(61),
-						EchoInterval:     pointer.Uint32Ptr(62),
-						EchoMode:         pointer.BoolPtr(false),
-						PassiveMode:      pointer.BoolPtr(false),
-						MinimumTTL:       pointer.Uint32Ptr(254),
+						ReceiveInterval:  ptr.To(uint32(60)),
+						TransmitInterval: ptr.To(uint32(61)),
+						EchoInterval:     ptr.To(uint32(62)),
+						EchoMode:         ptr.To(false),
+						PassiveMode:      ptr.To(false),
+						MinimumTTL:       ptr.To(uint32(254)),
 					},
 				}, ipfamily.DualStack, []string{v4PoolAddresses, v6PoolAddresses}, func(svc *corev1.Service) {
 					testservice.TrafficPolicyCluster(svc)
@@ -602,14 +911,14 @@ var _ = ginkgo.Describe("BGP", func() {
 			var pools []metallbv1beta1.IPAddressPool
 
 			allNodes, err := cs.CoreV1().Nodes().List(context.Background(), metav1.ListOptions{})
-			framework.ExpectNoError(err)
+			Expect(err).NotTo(HaveOccurred())
 
 			for i := 0; i < 2; i++ {
 				ginkgo.By(fmt.Sprintf("configure addresspool number %d", i+1))
 				firstIP, err := config.GetIPFromRangeByIndex(addressRange, i*10+1)
-				framework.ExpectNoError(err)
+				Expect(err).NotTo(HaveOccurred())
 				lastIP, err := config.GetIPFromRangeByIndex(addressRange, i*10+10)
-				framework.ExpectNoError(err)
+				Expect(err).NotTo(HaveOccurred())
 				addressesRange := fmt.Sprintf("%s-%s", firstIP, lastIP)
 				pool := metallbv1beta1.IPAddressPool{
 					ObjectMeta: metav1.ObjectMeta{
@@ -629,35 +938,35 @@ var _ = ginkgo.Describe("BGP", func() {
 
 				for _, c := range FRRContainers {
 					err := frrcontainer.PairWithNodes(cs, c, ipFamily)
-					framework.ExpectNoError(err)
+					Expect(err).NotTo(HaveOccurred())
 				}
 
 				err = ConfigUpdater.Update(resources)
-				framework.ExpectNoError(err)
+				Expect(err).NotTo(HaveOccurred())
 
 				for _, c := range FRRContainers {
 					validateFRRPeeredWithAllNodes(cs, c, ipFamily)
 				}
 
 				ginkgo.By(fmt.Sprintf("configure service number %d", i+1))
-				svc, _ := testservice.CreateWithBackend(cs, f.Namespace.Name, fmt.Sprintf("svc%d", i+1), testservice.TrafficPolicyCluster, func(svc *corev1.Service) {
-					svc.Annotations = map[string]string{"metallb.universe.tf/address-pool": fmt.Sprintf("test-addresspool%d", i+1)}
+				svc, _ := testservice.CreateWithBackend(cs, testNamespace, fmt.Sprintf("svc%d", i+1), testservice.TrafficPolicyCluster, func(svc *corev1.Service) {
+					svc.Annotations = map[string]string{"metallb.io/address-pool": fmt.Sprintf("test-addresspool%d", i+1)}
 				})
 				defer testservice.Delete(cs, svc)
 
 				ginkgo.By("validate LoadBalancer IP is in the AddressPool range")
-				ingressIP := e2eservice.GetIngressPoint(
+				ingressIP := jigservice.GetIngressPoint(
 					&svc.Status.LoadBalancer.Ingress[0])
 				err = config.ValidateIPInRange([]metallbv1beta1.IPAddressPool{pool}, ingressIP)
-				framework.ExpectNoError(err)
+				Expect(err).NotTo(HaveOccurred())
 
 				services = append(services, svc)
 				servicesIngressIP = append(servicesIngressIP, ingressIP)
 
 				for j := 0; j <= i; j++ {
 					ginkgo.By(fmt.Sprintf("validate service %d IP didn't change", j+1))
-					ip := e2eservice.GetIngressPoint(&services[j].Status.LoadBalancer.Ingress[0])
-					framework.ExpectEqual(ip, servicesIngressIP[j])
+					ip := jigservice.GetIngressPoint(&services[j].Status.LoadBalancer.Ingress[0])
+					Expect(ip).To(Equal(servicesIngressIP[j]))
 
 					ginkgo.By(fmt.Sprintf("checking connectivity of service %d to its external VIP", j+1))
 					for _, c := range FRRContainers {
@@ -678,10 +987,10 @@ var _ = ginkgo.Describe("BGP", func() {
 					BGPAdvs: []metallbv1beta1.BGPAdvertisement{emptyBGPAdvertisement},
 				}
 				err := ConfigUpdater.Update(resources)
-				framework.ExpectNoError(err)
+				Expect(err).NotTo(HaveOccurred())
 
 				err = frrcontainer.PairWithNodes(cs, c, ipFamily)
-				framework.ExpectNoError(err)
+				Expect(err).NotTo(HaveOccurred())
 
 				validateFRRPeeredWithAllNodes(cs, FRRContainers[i], ipFamily)
 			}
@@ -690,7 +999,7 @@ var _ = ginkgo.Describe("BGP", func() {
 			ginkgo.Entry("IPV6", ipfamily.IPv6))
 
 		ginkgo.DescribeTable("configure bgp advertisement and verify it gets propagated",
-			func(rangeWithAdvertisement string, rangeWithoutAdvertisement string, advertisement metallbv1beta1.BGPAdvertisement, legacy bool,
+			func(rangeWithAdvertisement string, rangeWithoutAdvertisement string, advertisement metallbv1beta1.BGPAdvertisement,
 				ipFamily ipfamily.Family, communities []metallbv1beta1.Community) {
 				emptyAdvertisement := metallbv1beta1.BGPAdvertisement{
 					ObjectMeta: metav1.ObjectMeta{
@@ -724,49 +1033,41 @@ var _ = ginkgo.Describe("BGP", func() {
 					Communities: communities,
 				}
 
-				if !legacy {
-					resources.Pools = []metallbv1beta1.IPAddressPool{poolWithAdvertisement, poolWithoutAdvertisement}
-					resources.BGPAdvs = []metallbv1beta1.BGPAdvertisement{emptyAdvertisement, advertisement}
-				} else {
-					resources.LegacyAddressPools = make([]metallbv1beta1.AddressPool, 0)
-					resources.LegacyAddressPools = []metallbv1beta1.AddressPool{
-						config.IPAddressPoolToLegacy(poolWithAdvertisement, config.BGP, []metallbv1beta1.BGPAdvertisement{advertisement}),
-						config.IPAddressPoolToLegacy(poolWithoutAdvertisement, config.BGP, []metallbv1beta1.BGPAdvertisement{}),
-					}
-				}
+				resources.Pools = []metallbv1beta1.IPAddressPool{poolWithAdvertisement, poolWithoutAdvertisement}
+				resources.BGPAdvs = []metallbv1beta1.BGPAdvertisement{emptyAdvertisement, advertisement}
 
 				for _, c := range FRRContainers {
 					err := frrcontainer.PairWithNodes(cs, c, ipFamily)
-					framework.ExpectNoError(err)
+					Expect(err).NotTo(HaveOccurred())
 				}
 
 				err := ConfigUpdater.Update(resources)
-				framework.ExpectNoError(err)
+				Expect(err).NotTo(HaveOccurred())
 
 				for _, c := range FRRContainers {
 					validateFRRPeeredWithAllNodes(cs, c, ipFamily)
 				}
 
 				ipWithAdvertisement, err := config.GetIPFromRangeByIndex(rangeWithAdvertisement, 0)
-				framework.ExpectNoError(err)
+				Expect(err).NotTo(HaveOccurred())
 				ipWithAdvertisement1, err := config.GetIPFromRangeByIndex(rangeWithAdvertisement, 1)
-				framework.ExpectNoError(err)
+				Expect(err).NotTo(HaveOccurred())
 				ipNoAdvertisement, err := config.GetIPFromRangeByIndex(rangeWithoutAdvertisement, 0)
-				framework.ExpectNoError(err)
+				Expect(err).NotTo(HaveOccurred())
 
-				svcAdvertisement, _ := testservice.CreateWithBackend(cs, f.Namespace.Name, "service-with-adv",
+				svcAdvertisement, _ := testservice.CreateWithBackend(cs, testNamespace, "service-with-adv",
 					func(s *corev1.Service) {
 						s.Spec.LoadBalancerIP = ipWithAdvertisement
 					},
 					testservice.TrafficPolicyCluster)
 				defer testservice.Delete(cs, svcAdvertisement)
-				svcAdvertisement1, _ := testservice.CreateWithBackend(cs, f.Namespace.Name, "service-with-adv1",
+				svcAdvertisement1, _ := testservice.CreateWithBackend(cs, testNamespace, "service-with-adv1",
 					func(s *corev1.Service) {
 						s.Spec.LoadBalancerIP = ipWithAdvertisement1
 					},
 					testservice.TrafficPolicyCluster)
 				defer testservice.Delete(cs, svcAdvertisement1)
-				svcNoAdvertisement, _ := testservice.CreateWithBackend(cs, f.Namespace.Name, "service-no-adv",
+				svcNoAdvertisement, _ := testservice.CreateWithBackend(cs, testNamespace, "service-no-adv",
 					func(s *corev1.Service) {
 						s.Spec.LoadBalancerIP = ipNoAdvertisement
 					},
@@ -774,7 +1075,7 @@ var _ = ginkgo.Describe("BGP", func() {
 				defer testservice.Delete(cs, svcNoAdvertisement)
 
 				allNodes, err := cs.CoreV1().Nodes().List(context.Background(), metav1.ListOptions{})
-				framework.ExpectNoError(err)
+				Expect(err).NotTo(HaveOccurred())
 
 				for _, c := range FRRContainers {
 					validateService(svcAdvertisement, allNodes.Items, c)
@@ -842,7 +1143,6 @@ var _ = ginkgo.Describe("BGP", func() {
 						IPAddressPools: []string{"bgp-with-advertisement"},
 					},
 				},
-				false,
 				ipfamily.IPv4,
 				[]metallbv1beta1.Community{}),
 			ginkgo.Entry("FRR - IPV4 - large community and localpref",
@@ -856,7 +1156,6 @@ var _ = ginkgo.Describe("BGP", func() {
 						IPAddressPools: []string{"bgp-with-advertisement"},
 					},
 				},
-				false,
 				ipfamily.IPv4,
 				[]metallbv1beta1.Community{}),
 			ginkgo.Entry("IPV4 - localpref",
@@ -869,7 +1168,6 @@ var _ = ginkgo.Describe("BGP", func() {
 						IPAddressPools: []string{"bgp-with-advertisement"},
 					},
 				},
-				false,
 				ipfamily.IPv4,
 				[]metallbv1beta1.Community{}),
 			ginkgo.Entry("IPV4 - community",
@@ -882,7 +1180,6 @@ var _ = ginkgo.Describe("BGP", func() {
 						IPAddressPools: []string{"bgp-with-advertisement"},
 					},
 				},
-				false,
 				ipfamily.IPv4,
 				[]metallbv1beta1.Community{}),
 			ginkgo.Entry("IPV4 - community from CRD",
@@ -896,49 +1193,8 @@ var _ = ginkgo.Describe("BGP", func() {
 						IPAddressPools: []string{"bgp-with-advertisement"},
 					},
 				},
-				false,
 				ipfamily.IPv4,
 				[]metallbv1beta1.Community{noAdvCommunity}),
-			ginkgo.Entry("IPV4 - community and localpref - legacy",
-				"192.168.10.0/24",
-				"192.168.16.0/24",
-				metallbv1beta1.BGPAdvertisement{
-					ObjectMeta: metav1.ObjectMeta{Name: "advertisement"},
-					Spec: metallbv1beta1.BGPAdvertisementSpec{
-						Communities:    []string{CommunityNoAdv},
-						LocalPref:      50,
-						IPAddressPools: []string{"bgp-with-advertisement"},
-					},
-				},
-				true,
-				ipfamily.IPv4,
-				[]metallbv1beta1.Community{}),
-			ginkgo.Entry("IPV4 - community from CRD - legacy",
-				"192.168.10.0/24",
-				"192.168.16.0/24",
-				metallbv1beta1.BGPAdvertisement{
-					ObjectMeta: metav1.ObjectMeta{Name: "advertisement"},
-					Spec: metallbv1beta1.BGPAdvertisementSpec{
-						Communities:    []string{"NO_ADVERTISE"},
-						IPAddressPools: []string{"bgp-with-advertisement"},
-					},
-				},
-				true,
-				ipfamily.IPv4,
-				[]metallbv1beta1.Community{noAdvCommunity}),
-			ginkgo.Entry("IPV4 - localpref - legacy",
-				"192.168.10.0/24",
-				"192.168.16.0/24",
-				metallbv1beta1.BGPAdvertisement{
-					ObjectMeta: metav1.ObjectMeta{Name: "advertisement"},
-					Spec: metallbv1beta1.BGPAdvertisementSpec{
-						LocalPref:      50,
-						IPAddressPools: []string{"bgp-with-advertisement"},
-					},
-				},
-				true,
-				ipfamily.IPv4,
-				[]metallbv1beta1.Community{}),
 			ginkgo.Entry("IPV4 - ip pool selector",
 				"192.168.10.0/24",
 				"192.168.16.0/24",
@@ -956,7 +1212,6 @@ var _ = ginkgo.Describe("BGP", func() {
 						},
 					},
 				},
-				false,
 				ipfamily.IPv4,
 				[]metallbv1beta1.Community{}),
 			ginkgo.Entry("IPV6 - community and localpref",
@@ -970,7 +1225,6 @@ var _ = ginkgo.Describe("BGP", func() {
 						IPAddressPools: []string{"bgp-with-advertisement"},
 					},
 				},
-				false,
 				ipfamily.IPv6,
 				[]metallbv1beta1.Community{}),
 			ginkgo.Entry("IPV6 - community",
@@ -983,7 +1237,6 @@ var _ = ginkgo.Describe("BGP", func() {
 						IPAddressPools: []string{"bgp-with-advertisement"},
 					},
 				},
-				false,
 				ipfamily.IPv6,
 				[]metallbv1beta1.Community{}),
 			ginkgo.Entry("IPV6 - community from CRD",
@@ -996,20 +1249,6 @@ var _ = ginkgo.Describe("BGP", func() {
 						IPAddressPools: []string{"bgp-with-advertisement"},
 					},
 				},
-				false,
-				ipfamily.IPv6,
-				[]metallbv1beta1.Community{noAdvCommunity}),
-			ginkgo.Entry("IPV6 - community from CRD - legacy",
-				"fc00:f853:0ccd:e799::0-fc00:f853:0ccd:e799::18",
-				"fc00:f853:0ccd:e799::19-fc00:f853:0ccd:e799::26",
-				metallbv1beta1.BGPAdvertisement{
-					ObjectMeta: metav1.ObjectMeta{Name: "advertisement"},
-					Spec: metallbv1beta1.BGPAdvertisementSpec{
-						Communities:    []string{"NO_ADVERTISE"},
-						IPAddressPools: []string{"bgp-with-advertisement"},
-					},
-				},
-				true,
 				ipfamily.IPv6,
 				[]metallbv1beta1.Community{noAdvCommunity}),
 			ginkgo.Entry("IPV6 - localpref",
@@ -1022,7 +1261,6 @@ var _ = ginkgo.Describe("BGP", func() {
 						IPAddressPools: []string{"bgp-with-advertisement"},
 					},
 				},
-				false,
 				ipfamily.IPv6,
 				[]metallbv1beta1.Community{}),
 			ginkgo.Entry("FRR - IPV6 - large community and localpref",
@@ -1036,7 +1274,6 @@ var _ = ginkgo.Describe("BGP", func() {
 						IPAddressPools: []string{"bgp-with-advertisement"},
 					},
 				},
-				false,
 				ipfamily.IPv6,
 				[]metallbv1beta1.Community{}))
 	})
@@ -1068,11 +1305,11 @@ var _ = ginkgo.Describe("BGP", func() {
 						frr.NeighborConfig.ToAdvertiseV6 = []string{toInject}
 					}
 				})
-				framework.ExpectNoError(err)
+				Expect(err).NotTo(HaveOccurred())
 			}
 
 			speakerPods, err := metallb.SpeakerPods(cs)
-			framework.ExpectNoError(err)
+			Expect(err).NotTo(HaveOccurred())
 			checkRoute := func() error {
 				isRouteInjected, where := isRouteInjected(speakerPods, pairingIPFamily, toInject, "all")
 				if isRouteInjected {
@@ -1082,14 +1319,14 @@ var _ = ginkgo.Describe("BGP", func() {
 			}
 
 			err = ConfigUpdater.Update(resources)
-			framework.ExpectNoError(err)
+			Expect(err).NotTo(HaveOccurred())
 
 			for _, c := range FRRContainers {
 				validateFRRPeeredWithAllNodes(cs, c, pairingIPFamily)
 			}
 
 			Consistently(checkRoute, 30*time.Second, 1*time.Second).ShouldNot(HaveOccurred())
-			svc, _ := testservice.CreateWithBackend(cs, f.Namespace.Name, "external-local-lb")
+			svc, _ := testservice.CreateWithBackend(cs, testNamespace, "external-local-lb")
 			defer testservice.Delete(cs, svc)
 
 			Consistently(checkRoute, 30*time.Second, 1*time.Second).ShouldNot(HaveOccurred())
@@ -1100,29 +1337,19 @@ var _ = ginkgo.Describe("BGP", func() {
 	})
 
 	ginkgo.Context("MetalLB allows adding extra FRR configuration", func() {
+		type toApply string
+		var configmap toApply = "configmap"
+		var frrconfiguration toApply = "frrconfiguration"
 		type whenApply string
 		var before whenApply = "before"
 		var after whenApply = "after"
 		ginkgo.AfterEach(func() {
 			err := k8s.RemoveConfigmap(cs, "bgpextras", metallb.Namespace)
-			framework.ExpectNoError(err)
+			Expect(err).NotTo(HaveOccurred())
 		})
-		ginkgo.DescribeTable("to accept any routes advertised by any neighbor", func(addressesRange, toInject string, pairingIPFamily ipfamily.Family, when whenApply) {
+		ginkgo.DescribeTable("to accept any routes advertised by any neighbor", func(addressesRange, toInject string, pairingIPFamily ipfamily.Family, what toApply, when whenApply) {
 			resources := config.Resources{
-				Pools: []metallbv1beta1.IPAddressPool{
-					{
-						ObjectMeta: metav1.ObjectMeta{
-							Name: "rejectroutes",
-						},
-						Spec: metallbv1beta1.IPAddressPoolSpec{
-							Addresses: []string{
-								addressesRange,
-							},
-						},
-					},
-				},
-				Peers:   metallb.PeersForContainers(FRRContainers, pairingIPFamily),
-				BGPAdvs: []metallbv1beta1.BGPAdvertisement{emptyBGPAdvertisement},
+				Peers: metallb.PeersForContainers(FRRContainers, pairingIPFamily),
 			}
 
 			toFilter := "172.16.2.1/32"
@@ -1140,11 +1367,11 @@ var _ = ginkgo.Describe("BGP", func() {
 						frr.NeighborConfig.ToAdvertiseV6 = []string{fmt.Sprintf(toInject, i+1), toFilter}
 					}
 				})
-				framework.ExpectNoError(err)
+				Expect(err).NotTo(HaveOccurred())
 			}
 
 			speakerPods, err := metallb.SpeakerPods(cs)
-			framework.ExpectNoError(err)
+			Expect(err).NotTo(HaveOccurred())
 			checkRoutesAreInjected := func() error {
 				for i, c := range FRRContainers {
 					injected, _ := isRouteInjected(speakerPods, pairingIPFamily, fmt.Sprintf(toInject, i+1), c.RouterConfig.VRF)
@@ -1159,59 +1386,158 @@ var _ = ginkgo.Describe("BGP", func() {
 				return nil
 			}
 
-			data := ""
-			data += "ip prefix-list allowed permit 172.16.1.0/24 le 32\n"
-			data += "ipv6 prefix-list allowed permit fc00:f853:ccd:e800::/64 le 128\n"
-			for _, c := range FRRContainers {
-				ip := c.Ipv4
-				if pairingIPFamily == ipfamily.IPv6 {
-					ip = c.Ipv6
+			applyConfigMap := func() {
+				data := ""
+				data += "ip prefix-list allowed permit 172.16.1.0/24 le 32\n"
+				data += "ipv6 prefix-list allowed permit fc00:f853:ccd:e800::/64 le 128\n"
+				for _, c := range FRRContainers {
+					ip := c.Ipv4
+					if pairingIPFamily == ipfamily.IPv6 {
+						ip = c.Ipv6
+					}
+					ruleName := ip
+					if c.RouterConfig.VRF != "" {
+						ruleName = fmt.Sprintf("%s-%s", ip, c.RouterConfig.VRF)
+					}
+					data += fmt.Sprintf("route-map %s-in permit 20\n", ruleName)
+					if pairingIPFamily == ipfamily.IPv4 {
+						data += "  match ip address prefix-list allowed\n"
+					} else {
+						data += "  match ipv6 address prefix-list allowed\n"
+					}
 				}
-				ruleName := ip
-				if c.RouterConfig.VRF != "" {
-					ruleName = fmt.Sprintf("%s-%s", ip, c.RouterConfig.VRF)
+				extraData := map[string]string{
+					"extras": data,
 				}
-				data += fmt.Sprintf("route-map %s-in permit 20\n", ruleName)
-				if pairingIPFamily == ipfamily.IPv4 {
-					data += "  match ip address prefix-list allowed\n"
-				} else {
-					data += "  match ipv6 address prefix-list allowed\n"
-				}
+
+				err = k8s.CreateConfigmap(cs, "bgpextras", metallb.Namespace, extraData)
+				Expect(err).NotTo(HaveOccurred())
 			}
-			extraData := map[string]string{
-				"extras": data,
+
+			applyFRRConfiguration := func() {
+				config := frrk8sv1beta1.FRRConfiguration{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "receiveroutes",
+						Namespace: metallb.FRRK8sNamespace,
+					},
+					Spec: frrk8sv1beta1.FRRConfigurationSpec{
+						BGP: frrk8sv1beta1.BGPConfig{
+							Routers: []frrk8sv1beta1.Router{},
+						},
+					},
+				}
+
+				routers := map[string]frrk8sv1beta1.Router{}
+				for _, p := range resources.Peers {
+					p := p
+					r := routers[p.Spec.VRFName]
+					r.ASN = p.Spec.MyASN
+					r.VRF = p.Spec.VRFName
+
+					keepAliveTime := p.Spec.KeepaliveTime
+					if keepAliveTime == nil && p.Spec.HoldTime != nil {
+						keepAliveTime = &metav1.Duration{Duration: p.Spec.HoldTime.Duration / 3}
+					}
+					r.Neighbors = append(r.Neighbors, frrk8sv1beta1.Neighbor{
+						ASN:           p.Spec.ASN,
+						Address:       p.Spec.Address,
+						Password:      p.Spec.Password,
+						Port:          &p.Spec.Port,
+						HoldTime:      p.Spec.HoldTime,
+						KeepaliveTime: keepAliveTime,
+						EBGPMultiHop:  p.Spec.EBGPMultiHop,
+						BFDProfile:    p.Spec.BFDProfile,
+						ToReceive: frrk8sv1beta1.Receive{
+							Allowed: frrk8sv1beta1.AllowedInPrefixes{
+								Mode: frrk8sv1beta1.AllowRestricted,
+								Prefixes: []frrk8sv1beta1.PrefixSelector{
+									{
+										Prefix: "172.16.1.0/24",
+										LE:     32,
+									},
+									{
+										Prefix: "fc00:f853:ccd:e800::/64",
+										LE:     128,
+									},
+								},
+							},
+						},
+					})
+					routers[p.Spec.VRFName] = r
+				}
+
+				for _, router := range routers {
+					config.Spec.BGP.Routers = append(config.Spec.BGP.Routers, router)
+				}
+
+				err := ConfigUpdater.Client().Create(context.Background(), &config)
+				Expect(err).NotTo(HaveOccurred())
+			}
+
+			removeFRRConfiguration := func() {
+				config := frrk8sv1beta1.FRRConfiguration{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "receiveroutes",
+						Namespace: metallb.FRRK8sNamespace,
+					},
+				}
+
+				err := ConfigUpdater.Client().Delete(context.Background(), &config)
+				if k8serrors.IsNotFound(err) {
+					return
+				}
+				Expect(err).NotTo(HaveOccurred())
+			}
+
+			apply := applyConfigMap
+			if what == frrconfiguration {
+				apply = applyFRRConfiguration
+				defer removeFRRConfiguration()
 			}
 
 			if when == before {
-				ginkgo.By("Applying a configmap that allows incoming routes")
-
-				err = k8s.CreateConfigmap(cs, "bgpextras", metallb.Namespace, extraData)
-				framework.ExpectNoError(err)
+				ginkgo.By("Applying the config that allows incoming routes")
+				apply()
 			}
 
 			ginkgo.By("Applying the FRR configuration")
 			err = ConfigUpdater.Update(resources)
-			framework.ExpectNoError(err)
+			Expect(err).NotTo(HaveOccurred())
 
 			for _, c := range FRRContainers {
 				validateFRRPeeredWithAllNodes(cs, c, pairingIPFamily)
 			}
 
 			if when == after {
-				ginkgo.By("Applying a configmap that allows incoming routes")
-				err = k8s.CreateConfigmap(cs, "bgpextras", metallb.Namespace, extraData)
-				framework.ExpectNoError(err)
+				ginkgo.By("Applying the config that allows incoming routes")
+				apply()
 			}
 			Eventually(checkRoutesAreInjected, time.Minute, 1*time.Second).ShouldNot(HaveOccurred())
+
+			_, svc := setupBGPService(cs, testNamespace, pairingIPFamily, []string{addressesRange}, FRRContainers, func(svc *corev1.Service) {})
+			defer testservice.Delete(cs, svc)
+
+			allNodes, err := cs.CoreV1().Nodes().List(context.Background(), metav1.ListOptions{})
+			Expect(err).NotTo(HaveOccurred())
+			testservice.ValidateDesiredLB(svc)
+
+			for _, container := range FRRContainers {
+				ginkgo.By(fmt.Sprintf("validating the service from %s", container.Name))
+				validateService(svc, allNodes.Items, container)
+			}
 		},
-			ginkgo.Entry("IPV4 - before config", "192.168.10.0/24", "172.16.1.%d/32", ipfamily.IPv4, before),
-			ginkgo.Entry("IPV6 - before config", "fc00:f853:0ccd:e799::/116", "fc00:f853:ccd:e800::%d/128", ipfamily.IPv6, before),
-			ginkgo.Entry("IPV4 - after config", "192.168.10.0/24", "172.16.1.%d/32", ipfamily.IPv4, after),
-			ginkgo.Entry("IPV6 - after config", "fc00:f853:0ccd:e799::/116", "fc00:f853:ccd:e800::%d/128", ipfamily.IPv6, after),
+			ginkgo.Entry("FRR-MODE IPV4 - before config", "192.168.10.0/24", "172.16.1.%d/32", ipfamily.IPv4, configmap, before),
+			ginkgo.Entry("FRR-MODE IPV6 - before config", "fc00:f853:0ccd:e799::/116", "fc00:f853:ccd:e800::%d/128", ipfamily.IPv6, configmap, before),
+			ginkgo.Entry("FRR-MODE IPV4 - after config", "192.168.10.0/24", "172.16.1.%d/32", ipfamily.IPv4, configmap, after),
+			ginkgo.Entry("FRR-MODE IPV6 - after config", "fc00:f853:0ccd:e799::/116", "fc00:f853:ccd:e800::%d/128", ipfamily.IPv6, configmap, after),
+			ginkgo.Entry("FRRK8S-MODE IPV4 - before config", "192.168.10.0/24", "172.16.1.%d/32", ipfamily.IPv4, frrconfiguration, before),
+			ginkgo.Entry("FRRK8S-MODE IPV6 - before config", "fc00:f853:0ccd:e799::/116", "fc00:f853:ccd:e800::%d/128", ipfamily.IPv6, frrconfiguration, before),
+			ginkgo.Entry("FRRK8S-MODE IPV4 - after config", "192.168.10.0/24", "172.16.1.%d/32", ipfamily.IPv4, frrconfiguration, after),
+			ginkgo.Entry("FRRK8S-MODE IPV6 - after config", "fc00:f853:0ccd:e799::/116", "fc00:f853:ccd:e800::%d/128", ipfamily.IPv6, frrconfiguration, after),
 		)
 	})
 
-	ginkgo.Context("FRR validate reload feedback", func() {
+	ginkgo.Context("FRR-MODE FRR validate reload feedback", func() {
 		ginkgo.It("should update MetalLB config and log reload-validate success", func() {
 			resources := config.Resources{
 				Pools: []metallbv1beta1.IPAddressPool{
@@ -1233,15 +1559,15 @@ var _ = ginkgo.Describe("BGP", func() {
 			beforeUpdateTime := metav1.Now()
 
 			err := ConfigUpdater.Update(resources)
-			framework.ExpectNoError(err)
+			Expect(err).NotTo(HaveOccurred())
 
 			speakerPods, err := metallb.SpeakerPods(cs)
-			framework.ExpectNoError(err)
+			Expect(err).NotTo(HaveOccurred())
 
 			for _, pod := range speakerPods {
 				Eventually(func() string {
 					logs, err := k8s.PodLogsSinceTime(cs, pod, SpeakerContainerName, &beforeUpdateTime)
-					framework.ExpectNoError(err)
+					Expect(err).NotTo(HaveOccurred())
 
 					return logs
 				}, 2*time.Minute, 1*time.Second).Should(
@@ -1273,12 +1599,12 @@ var _ = ginkgo.Describe("BGP", func() {
 					{
 						ObjectMeta: metav1.ObjectMeta{Name: "fullbfdprofile1"},
 						Spec: metallbv1beta1.BFDProfileSpec{
-							ReceiveInterval:  pointer.Uint32Ptr(93),
-							TransmitInterval: pointer.Uint32Ptr(95),
-							EchoInterval:     pointer.Uint32Ptr(97),
-							EchoMode:         pointer.BoolPtr(true),
-							PassiveMode:      pointer.BoolPtr(true),
-							MinimumTTL:       pointer.Uint32Ptr(253),
+							ReceiveInterval:  ptr.To(uint32(93)),
+							TransmitInterval: ptr.To(uint32(95)),
+							EchoInterval:     ptr.To(uint32(97)),
+							EchoMode:         ptr.To(true),
+							PassiveMode:      ptr.To(true),
+							MinimumTTL:       ptr.To(uint32(253)),
 						},
 					},
 				},
@@ -1296,18 +1622,19 @@ var _ = ginkgo.Describe("BGP", func() {
 			})
 
 			for i := range resources.Peers {
-				resources.Peers[i].Spec.KeepaliveTime = metav1.Duration{Duration: 13 * time.Second}
-				resources.Peers[i].Spec.HoldTime = metav1.Duration{Duration: 57 * time.Second}
+				resources.Peers[i].Spec.KeepaliveTime = &metav1.Duration{Duration: 13 * time.Second}
+				resources.Peers[i].Spec.HoldTime = &metav1.Duration{Duration: 57 * time.Second}
 			}
 
 			err := ConfigUpdater.Update(resources)
-			framework.ExpectNoError(err)
+			Expect(err).NotTo(HaveOccurred())
 
 			speakerPods, err := metallb.SpeakerPods(cs)
-			framework.ExpectNoError(err)
+			Expect(err).NotTo(HaveOccurred())
 
 			for _, pod := range speakerPods {
-				podExecutor := executor.ForPod(pod.Namespace, pod.Name, "frr")
+				podExecutor, err := FRRProvider.FRRExecutorFor(pod.Namespace, pod.Name)
+				Expect(err).NotTo(HaveOccurred())
 
 				Eventually(func() string {
 					// We need to assert against the output of the command as a bare string, as
@@ -1320,7 +1647,7 @@ var _ = ginkgo.Describe("BGP", func() {
 					return cfgStr
 				}, 1*time.Minute).Should(
 					And(
-						ContainSubstring("log file /etc/frr/frr.log"),
+						ContainSubstring("log stdout"),
 						WithTransform(substringCount("\n profile fullbfdprofile1"), Equal(1)),
 						ContainSubstring("receive-interval 93"),
 						ContainSubstring("transmit-interval 95"),
@@ -1336,18 +1663,59 @@ var _ = ginkgo.Describe("BGP", func() {
 			ginkgo.By("Checking the default value on the bgppeer crds is set")
 			peer := metallbv1beta2.BGPPeer{}
 			err = ConfigUpdater.Client().Get(context.Background(), types.NamespacedName{Name: "defaultport", Namespace: metallb.Namespace}, &peer)
-			framework.ExpectNoError(err)
-			framework.ExpectEqual(peer.Spec.Port, uint16(179))
+			Expect(err).NotTo(HaveOccurred())
+			Expect(peer.Spec.Port).To(Equal(uint16(179)))
+		})
+		ginkgo.It("BGP Peer parameters", func() {
+			connectTime := time.Second * 5
+			resources := config.Resources{
+				Peers: metallb.PeersForContainers(FRRContainers, ipfamily.IPv4, func(p *metallbv1beta2.BGPPeer) {
+					p.Spec.ConnectTime = ptr.To(metav1.Duration{Duration: connectTime})
+				}),
+			}
+			err := ConfigUpdater.Update(resources)
+			Expect(err).NotTo(HaveOccurred())
+
+			speakerPods, err := metallb.SpeakerPods(cs)
+			Expect(err).NotTo(HaveOccurred())
+
+			for _, pod := range speakerPods {
+				podExec, err := FRRProvider.FRRExecutorFor(pod.Namespace, pod.Name)
+				Expect(err).NotTo(HaveOccurred())
+				Eventually(func() error {
+					neighbors, err := frr.NeighborsInfo(podExec)
+					if err != nil {
+						return err
+					}
+					if len(neighbors) == 0 {
+						return fmt.Errorf("expected at least 1 neighbor, got %d", len(neighbors))
+					}
+					for _, neighbor := range neighbors {
+						if neighbor.ConfiguredConnectTime != int(connectTime.Seconds()) {
+							return fmt.Errorf("expected connect time to be %d, got %d", int(connectTime.Seconds()), neighbor.ConfiguredConnectTime)
+						}
+
+						neighborFamily := ipfamily.ForAddress(net.ParseIP(neighbor.ID))
+						for _, family := range neighbor.AddressFamilies {
+							if !strings.Contains(family, string(neighborFamily)) {
+								return fmt.Errorf("expected %s neigbour to contain only %s families but contains %s", neighbor.ID, neighborFamily, family)
+							}
+						}
+					}
+					return nil
+				}, 2*time.Minute, time.Second).ShouldNot(HaveOccurred())
+			}
+
 		})
 	})
 	ginkgo.DescribeTable("A service of protocol load balancer should work with two protocols", func(pairingIPFamily ipfamily.Family, poolAddresses []string) {
-		_, svc := setupBGPService(f, pairingIPFamily, poolAddresses, FRRContainers, func(svc *corev1.Service) {
+		_, svc := setupBGPService(cs, testNamespace, pairingIPFamily, poolAddresses, FRRContainers, func(svc *corev1.Service) {
 			testservice.TrafficPolicyCluster(svc)
 		})
 		defer testservice.Delete(cs, svc)
 
 		allNodes, err := cs.CoreV1().Nodes().List(context.Background(), metav1.ListOptions{})
-		framework.ExpectNoError(err)
+		Expect(err).NotTo(HaveOccurred())
 
 		ginkgo.By("Checking the service is reacheable via BGP")
 		for _, c := range FRRContainers {
@@ -1356,7 +1724,7 @@ var _ = ginkgo.Describe("BGP", func() {
 
 		checkServiceL2 := func() error {
 			for _, ip := range svc.Status.LoadBalancer.Ingress {
-				ingressIP := e2eservice.GetIngressPoint(&ip)
+				ingressIP := jigservice.GetIngressPoint(&ip)
 				err := mac.RequestAddressResolution(ingressIP, executor.Host)
 				if err != nil {
 					return err
@@ -1377,7 +1745,7 @@ var _ = ginkgo.Describe("BGP", func() {
 		}
 
 		err = ConfigUpdater.Client().Create(context.Background(), &l2Advertisement)
-		framework.ExpectNoError(err)
+		Expect(err).NotTo(HaveOccurred())
 
 		ginkgo.By("Checking the service is reacheable via L2")
 		Eventually(func() error {
@@ -1391,7 +1759,7 @@ var _ = ginkgo.Describe("BGP", func() {
 
 		ginkgo.By("Deleting the l2 advertisement")
 		err = ConfigUpdater.Client().Delete(context.Background(), &l2Advertisement)
-		framework.ExpectNoError(err)
+		Expect(err).NotTo(HaveOccurred())
 
 		ginkgo.By("Checking the service is not reacheable via L2 anymore")
 		// We use arping here, because the client's cache may still be filled with the mac and the ip of the
@@ -1400,6 +1768,33 @@ var _ = ginkgo.Describe("BGP", func() {
 	},
 		ginkgo.Entry("IPV4", ipfamily.IPv4, []string{l2tests.IPV4ServiceRange}),
 		ginkgo.Entry("IPV6", ipfamily.IPv6, []string{l2tests.IPV6ServiceRange}),
+	)
+	ginkgo.DescribeTable("FRR establishes connections with dynamic ASN ", func(pairingIPFamily ipfamily.Family) {
+		resources := config.Resources{
+			Peers: metallb.PeersForContainers(FRRContainers, pairingIPFamily, func(p *metallbv1beta2.BGPPeer) {
+				dynamicASN := metallbv1beta2.InternalASNMode
+				if p.Spec.ASN != p.Spec.MyASN {
+					dynamicASN = metallbv1beta2.ExternalASNMode
+				}
+				p.Spec.ASN = 0
+				p.Spec.DynamicASN = dynamicASN
+			}),
+		}
+
+		for _, c := range FRRContainers {
+			err := frrcontainer.PairWithNodes(cs, c, pairingIPFamily)
+			Expect(err).NotTo(HaveOccurred())
+		}
+
+		err := ConfigUpdater.Update(resources)
+		Expect(err).NotTo(HaveOccurred())
+
+		for _, c := range FRRContainers {
+			validateFRRPeeredWithAllNodes(cs, c, pairingIPFamily)
+		}
+	},
+		ginkgo.Entry("IPV4", ipfamily.IPv4),
+		ginkgo.Entry("IPV6", ipfamily.IPv6),
 	)
 })
 
